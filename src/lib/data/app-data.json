@@ -1,0 +1,190 @@
+{
+  "organizations": [
+    {
+      "id": "org-demo",
+      "name": "Verd Pancho Demo",
+      "slug": "verd-pancho-demo",
+      "address": "Av. Siempre Viva 123",
+      "phone": "1144445555",
+      "currency": "ARS",
+      "createdAt": "2024-01-01T10:00:00.000Z"
+    }
+  ],
+  "branches": [
+    {
+      "id": "branch-main",
+      "organizationId": "org-demo",
+      "name": "Sucursal Centro",
+      "address": "Av. Siempre Viva 123",
+      "createdAt": "2024-01-01T10:00:00.000Z"
+    },
+    {
+      "id": "branch-2",
+      "organizationId": "org-demo",
+      "name": "Sucursal Norte",
+      "address": "Belgrano 789",
+      "createdAt": "2024-01-02T10:00:00.000Z"
+    }
+  ],
+  "users": [
+    {
+      "id": "user-owner",
+      "organizationId": "org-demo",
+      "branchId": "branch-main",
+      "name": "Tomás Owner",
+      "email": "owner@verdpancho.com",
+      "role": "propietario",
+      "createdAt": "2024-01-01T10:00:00.000Z"
+    },
+    {
+      "id": "user-cashier",
+      "organizationId": "org-demo",
+      "branchId": "branch-main",
+      "name": "Lucía Cajera",
+      "email": "cajera@verdpancho.com",
+      "role": "cajero",
+      "createdAt": "2024-01-01T10:00:00.000Z"
+    }
+  ],
+  "products": [
+    {
+      "id": "prod-1",
+      "organizationId": "org-demo",
+      "branchId": "branch-main",
+      "name": "Manzana",
+      "sku": "VER-001",
+      "barcode": "779000000001",
+      "category": "Frutas",
+      "price": 1800,
+      "cost": 900,
+      "stock": 12.5,
+      "minStock": 3,
+      "unitType": "peso",
+      "active": true,
+      "createdAt": "2024-01-05T12:00:00.000Z"
+    },
+    {
+      "id": "prod-2",
+      "organizationId": "org-demo",
+      "branchId": "branch-main",
+      "name": "Banana",
+      "sku": "VER-002",
+      "barcode": "779000000002",
+      "category": "Frutas",
+      "price": 1200,
+      "cost": 600,
+      "stock": 8,
+      "minStock": 2,
+      "unitType": "peso",
+      "active": true,
+      "createdAt": "2024-01-05T12:00:00.000Z"
+    },
+    {
+      "id": "prod-3",
+      "organizationId": "org-demo",
+      "branchId": "branch-main",
+      "name": "Tomate",
+      "sku": "VER-003",
+      "barcode": "779000000003",
+      "category": "Verduras",
+      "price": 1400,
+      "cost": 700,
+      "stock": 15,
+      "minStock": 4,
+      "unitType": "peso",
+      "active": true,
+      "createdAt": "2024-01-05T12:00:00.000Z"
+    },
+    {
+      "id": "prod-4",
+      "organizationId": "org-demo",
+      "branchId": "branch-main",
+      "name": "Lechuga",
+      "sku": "VER-004",
+      "barcode": "779000000004",
+      "category": "Verduras",
+      "price": 900,
+      "cost": 450,
+      "stock": 6.5,
+      "minStock": 2,
+      "unitType": "peso",
+      "active": true,
+      "createdAt": "2024-01-05T12:00:00.000Z"
+    }
+  ],
+  "sales": [
+    {
+      "id": "sale-1",
+      "organizationId": "org-demo",
+      "branchId": "branch-main",
+      "customerName": "Cliente demo",
+      "total": 5150,
+      "paymentMethod": "Efectivo",
+      "createdAt": "2024-02-03T20:40:00.000Z",
+      "items": [
+        {
+          "id": "item-1",
+          "productId": "prod-1",
+          "name": "Milanesa con papas",
+          "quantity": 1,
+          "unitPrice": 4200,
+          "total": 4200
+        },
+        {
+          "id": "item-2",
+          "productId": "prod-2",
+          "name": "Coca Cola 500ml",
+          "quantity": 1,
+          "unitPrice": 950,
+          "total": 950
+        }
+      ]
+    }
+  ],
+  "cashSessions": [
+    {
+      "id": "cash-1",
+      "organizationId": "org-demo",
+      "branchId": "branch-main",
+      "status": "cerrada",
+      "openingAmount": 10000,
+      "declaredAmount": 15000,
+      "expectedAmount": 15150,
+      "openedAt": "2024-02-03T19:00:00.000Z",
+      "closedAt": "2024-02-03T23:00:00.000Z"
+    }
+  ],
+  "tables": [
+    {
+      "id": "table-1",
+      "organizationId": "org-demo",
+      "branchId": "branch-main",
+      "tableNumber": 1,
+      "status": "ocupada",
+      "guests": 2,
+      "waiter": "Mica",
+      "total": 8400,
+      "updatedAt": "2024-02-03T20:30:00.000Z"
+    },
+    {
+      "id": "table-2",
+      "organizationId": "org-demo",
+      "branchId": "branch-main",
+      "tableNumber": 2,
+      "status": "libre",
+      "guests": 0,
+      "waiter": "",
+      "total": 0,
+      "updatedAt": "2024-02-03T20:15:00.000Z"
+    }
+  ],
+  "auditLogs": [
+    {
+      "id": "audit-1",
+      "action": "crear_producto",
+      "entity": "products",
+      "user": "owner@verdpancho.com",
+      "createdAt": "2024-02-03T19:10:00.000Z"
+    }
+  ]
+}
