@@ -359,48 +359,62 @@ export function PosClient({ initialProducts }: PosClientProps) {
         const incoming = Array.from(value);
         byteBuffer = [...byteBuffer, ...incoming].slice(-240);
 
-        const ascii = byteBuffer
-          .filter((byte) => byte >= 32 && byte <= 126)
-          .map((byte) => String.fromCharCode(byte))
-          .join("");
-
         const hex = incoming
           .map((byte) => byte.toString(16).padStart(2, "0").toUpperCase())
           .join(" ");
 
-        setScaleRawData(
-          `RESPUESTA RECIBIDA — ${selectedBaud} baudios / ${selectedCommand!.name} | HEX: ${hex}${ascii ? ` | ASCII: ${ascii.slice(-120)}` : ""}`
-        );
-
-        const matches = ascii.match(/-?\d+(?:[.,]\d+)?/g);
-        if (matches?.length) {
-          const rawWeight = matches.at(-1) ?? "";
-          let weight = Number(rawWeight.replace(",", "."));
-
-          if (Number.isFinite(weight)) {
-            if (!/[.,]/.test(rawWeight)) {
-              weight = weight / 1000;
-            }
-
-            if (weight >= 0) {
-              const normalizedWeight = weight.toFixed(3);
-              setManualWeight(normalizedWeight);
-              setScaleLastWeight(`${normalizedWeight} kg`);
-
-              if (selectedCommand!.name === "ENQ 0x05") {
-                try {
-                  await writer.write(new Uint8Array([0x06]));
-                } catch {}
-              }
-            }
-          }
-        }
-
         if (incoming.includes(0x11)) {
           setScaleRawData(
-            `RESPUESTA RECIBIDA — ${selectedBaud} baudios / ${selectedCommand!.name} | WACK: la balanza pidió espera. Reintentando...`
+            `RESPUESTA RECIBIDA — ${selectedBaud} baudios / ${selectedCommand!.name} | WACK: peso inestable, esperando que se estabilice...`
           );
+          return;
         }
+
+        // El peso válido de Croma llega en una trama:
+        // STX (0x02) + 6/7 caracteres ASCII de peso + ETX (0x03) + CRC.
+        const stxIndex = byteBuffer.lastIndexOf(0x02);
+        const etxIndex = stxIndex >= 0 ? byteBuffer.indexOf(0x03, stxIndex + 1) : -1;
+
+        if (stxIndex < 0 || etxIndex < 0 || etxIndex <= stxIndex + 1) {
+          setScaleRawData(
+            `RESPUESTA RECIBIDA — ${selectedBaud} baudios / ${selectedCommand!.name} | HEX: ${hex} | Esperando trama completa de peso...`
+          );
+          return;
+        }
+
+        const payloadBytes = byteBuffer.slice(stxIndex + 1, etxIndex);
+        const asciiWeight = payloadBytes
+          .map((byte) => String.fromCharCode(byte))
+          .join("")
+          .trim();
+
+        setScaleRawData(
+          `RESPUESTA RECIBIDA — ${selectedBaud} baudios / ${selectedCommand!.name} | PESO ASCII: ${asciiWeight} | HEX: ${hex}`
+        );
+
+        const match = asciiWeight.match(/^-?\d+(?:[.,]\d+)?$/);
+        if (!match) return;
+
+        let weight = Number(asciiWeight.replace(",", "."));
+        if (!Number.isFinite(weight)) return;
+
+        // El protocolo Systel envía el peso sin punto decimal, en gramos.
+        if (!/[.,]/.test(asciiWeight)) {
+          weight = weight / 1000;
+        }
+
+        const normalizedWeight = weight.toFixed(3);
+        setManualWeight(normalizedWeight);
+        setScaleLastWeight(`${normalizedWeight} kg`);
+
+        if (selectedCommand!.name === "ENQ 0x05") {
+          try {
+            await writer.write(new Uint8Array([0x06]));
+          } catch {}
+        }
+
+        // Conservamos solo lo posterior a la trama ya procesada.
+        byteBuffer = byteBuffer.slice(etxIndex + 1);
       };
 
       await processIncoming(firstValue);
