@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
-import { formatCurrency as formatCurrencyValue, notifyStoreUpdate, printSaleDocument, readCachedDocuments, readCachedProducts, readCachedSales, writeCachedDocuments, writeCachedProducts, writeCachedSales } from "@/lib/sale-sync";
+import { formatCurrency as formatCurrencyValue, notifyStoreUpdate, printSaleDocument, readCachedDocuments, readCachedSales, writeCachedDocuments, writeCachedProducts, writeCachedSales } from "@/lib/sale-sync";
 import type { Product } from "@/lib/types";
 
 type CartItem = {
@@ -54,28 +54,72 @@ export function PosClient({ initialProducts }: PosClientProps) {
   );
 
   useEffect(() => {
-    const saved = window.localStorage.getItem("verduleria-stock");
-    if (!saved) return;
+    let active = true;
 
-    const parsed = JSON.parse(saved) as Record<string, number>;
-    setProducts((current) =>
-      current.map((product) => ({
-        ...product,
-        stock: parsed[product.id] ?? product.stock,
-      }))
-    );
-  }, []);
+    const loadProducts = async () => {
+      if (cart.length > 0) return;
+
+      const { data, error } = await supabase
+        .from("products")
+        .select("*")
+        .order("name");
+
+      if (error) {
+        console.error("Error sincronizando productos con Supabase:", error);
+        return;
+      }
+
+      if (!data || !active) return;
+
+      setProducts(
+        data.map((product: any) => ({
+          id: product.id,
+          organizationId: product.organization_id ?? "demo",
+          branchId: product.branch_id ?? "demo",
+          name: product.name,
+          sku: product.sku ?? "",
+          barcode: product.barcode ?? "",
+          category: product.category ?? "Sin categoría",
+          price: Number(product.price ?? 0),
+          cost: Number(product.cost ?? 0),
+          stock: Number(product.stock ?? 0),
+          minStock: Number(product.min_stock ?? 0),
+          unitType: (product.unit_type as "unidad" | "peso") ?? "peso",
+          active: Boolean(product.active),
+          createdAt: product.created_at ?? new Date().toISOString(),
+        }))
+      );
+    };
+
+    void loadProducts();
+
+    const channel = supabase
+      .channel("pos-products-realtime")
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "products",
+        },
+        () => {
+          void loadProducts();
+        }
+      )
+      .subscribe();
+
+    const fallbackRefresh = window.setInterval(() => {
+      void loadProducts();
+    }, 5000);
+
+    return () => {
+      active = false;
+      window.clearInterval(fallbackRefresh);
+      void supabase.removeChannel(channel);
+    };
+  }, [cart.length]);
 
   useEffect(() => {
-    const cachedProducts = readCachedProducts();
-    if (cachedProducts.length > 0) {
-      setProducts(cachedProducts);
-    }
-  }, []);
-
-  useEffect(() => {
-    const snapshot = Object.fromEntries(products.map((product) => [product.id, product.stock]));
-    window.localStorage.setItem("verduleria-stock", JSON.stringify(snapshot));
     writeCachedProducts(products);
     notifyStoreUpdate("products");
   }, [products]);
