@@ -35,6 +35,8 @@ export function PosClient({ initialProducts }: PosClientProps) {
   const [scaleLastWeight, setScaleLastWeight] = useState<string | null>(null);
   const scalePortRef = useRef<any>(null);
   const scaleReaderRef = useRef<any>(null);
+  const scaleWriterRef = useRef<any>(null);
+  const scalePollTimerRef = useRef<number | null>(null);
   const [paymentMethod, setPaymentMethod] = useState<"efectivo" | "tarjeta" | null>(null);
   const [amountReceived, setAmountReceived] = useState("");
   const [showPaymentModal, setShowPaymentModal] = useState(false);
@@ -245,70 +247,180 @@ export function PosClient({ initialProducts }: PosClientProps) {
       setScaleLastWeight(null);
 
       const port = await serial.requestPort();
-      await port.open({ baudRate: 9600 });
+      await port.open({
+        baudRate: 9600,
+        dataBits: 8,
+        stopBits: 1,
+        parity: "none",
+        flowControl: "none",
+      });
+
       scalePortRef.current = port;
-      setScaleStatus("connected");
-      setScaleRawData("Puerto conectado a 9600 baudios. Esperando datos de la balanza...");
 
       const reader = port.readable?.getReader();
-      if (!reader) {
-        setScaleRawData("El puerto se abrió, pero no expone un flujo de lectura.");
+      const writer = port.writable?.getWriter();
+
+      if (!reader || !writer) {
+        setScaleRawData("El puerto se abrió, pero no permite lectura/escritura.");
         setScaleStatus("error");
         return;
       }
 
       scaleReaderRef.current = reader;
-      const decoder = new TextDecoder();
-      let buffer = "";
+      scaleWriterRef.current = writer;
+      setScaleStatus("connected");
 
-      while (reader) {
+      const commands = [
+        { name: "ENQ 0x05", bytes: new Uint8Array([0x05]) },
+        { name: "0x07", bytes: new Uint8Array([0x07]) },
+        { name: "0x07 0x07", bytes: new Uint8Array([0x07, 0x07]) },
+        { name: "P", bytes: new TextEncoder().encode("P") },
+        { name: "W", bytes: new TextEncoder().encode("W") },
+      ];
+
+      let attempts = 0;
+      let lastCommandIndex = 0;
+      let successfulCommandIndex: number | null = null;
+      let receivedData = false;
+      let writeInFlight = false;
+      let byteBuffer: number[] = [];
+
+      const sendQuery = async () => {
+        if (writeInFlight) return;
+        writeInFlight = true;
+
+        try {
+          const commandIndex =
+            successfulCommandIndex ?? Math.floor(attempts / 4) % commands.length;
+
+          lastCommandIndex = commandIndex;
+          const command = commands[commandIndex];
+
+          await writer.write(command.bytes);
+          attempts += 1;
+
+          if (!receivedData) {
+            setScaleRawData(
+              `Puerto conectado a 9600 baudios. Consultando peso con ${command.name}...`
+            );
+          }
+        } catch (error) {
+          console.error("Error enviando consulta a la balanza:", error);
+        } finally {
+          writeInFlight = false;
+        }
+      };
+
+      await sendQuery();
+
+      scalePollTimerRef.current = window.setInterval(() => {
+        void sendQuery();
+      }, 500);
+
+      while (true) {
         const { value, done } = await reader.read();
         if (done) break;
+        if (!value || value.length === 0) continue;
 
-        const chunk = decoder.decode(value, { stream: true });
-        buffer += chunk;
+        receivedData = true;
 
-        const visible = buffer
-          .replace(/\r/g, "\\r")
-          .replace(/\n/g, "\\n")
-          .replace(/\t/g, "\\t");
+        if (successfulCommandIndex === null) {
+          successfulCommandIndex = lastCommandIndex;
+        }
 
-        setScaleRawData(visible.slice(-220));
+        const incoming = Array.from(value as Uint8Array);
+        byteBuffer = [...byteBuffer, ...incoming].slice(-240);
 
-        const weights = buffer.match(/-?\d+(?:[.,]\d+)?/g);
-        if (weights?.length) {
-          const weightText = weights.at(-1) ?? "";
-          const weight = Number(weightText.replace(",", "."));
+        const ascii = byteBuffer
+          .filter((byte) => byte >= 32 && byte <= 126)
+          .map((byte) => String.fromCharCode(byte))
+          .join("");
 
-          if (Number.isFinite(weight) && weight >= 0) {
-            const normalizedWeight = String(weight);
-            setManualWeight(normalizedWeight);
-            setScaleLastWeight(normalizedWeight);
+        const hex = incoming
+          .map((byte) => byte.toString(16).padStart(2, "0").toUpperCase())
+          .join(" ");
+
+        setScaleRawData(
+          `Protocolo: ${commands[successfulCommandIndex].name} | HEX: ${hex}${ascii ? ` | ASCII: ${ascii.slice(-120)}` : ""}`
+        );
+
+        // Croma/Clipse suelen devolver el peso en gramos como ASCII.
+        // Ejemplo: "000750" => 0.750 kg.
+        const matches = ascii.match(/-?\d+(?:[.,]\d+)?/g);
+        if (matches?.length) {
+          const rawWeight = matches.at(-1) ?? "";
+          let weight = Number(rawWeight.replace(",", "."));
+
+          if (Number.isFinite(weight)) {
+            if (!/[.,]/.test(rawWeight)) {
+              weight = weight / 1000;
+            }
+
+            if (weight >= 0) {
+              const normalizedWeight = weight.toFixed(3);
+              setManualWeight(normalizedWeight);
+              setScaleLastWeight(`${normalizedWeight} kg`);
+
+              // El protocolo clásico solicita ACK luego de una trama válida.
+              if (successfulCommandIndex === 0) {
+                try {
+                  await writer.write(new Uint8Array([0x06]));
+                } catch (error) {
+                  console.error("No se pudo enviar ACK a la balanza:", error);
+                }
+              }
+            }
           }
         }
 
-        buffer = buffer.slice(-220);
+        // WACK (0x11) significa "espere"; el polling vuelve a consultar solo.
+        if (incoming.includes(0x11)) {
+          setScaleRawData(
+            `Protocolo: ${commands[successfulCommandIndex].name} | La balanza pidió espera (WACK). Reintentando...`
+          );
+        }
+      }
+
+      if (scalePollTimerRef.current !== null) {
+        window.clearInterval(scalePollTimerRef.current);
+        scalePollTimerRef.current = null;
       }
 
       setScaleRawData((current) =>
-        current === "Puerto conectado a 9600 baudios. Esperando datos de la balanza..."
-          ? "La conexión terminó sin recibir datos."
-          : current
+        receivedData ? current : "La conexión terminó sin recibir datos de la balanza."
       );
     } catch (error) {
       console.error("Error de balanza:", error);
-      setScaleRawData(error instanceof Error ? error.message : "Error desconocido al leer la balanza.");
+      setScaleRawData(
+        error instanceof Error
+          ? error.message
+          : "Error desconocido al conectar o leer la balanza."
+      );
       setScaleStatus("error");
     }
   };
 
   const disconnectScale = async () => {
     try {
+      if (scalePollTimerRef.current !== null) {
+        window.clearInterval(scalePollTimerRef.current);
+        scalePollTimerRef.current = null;
+      }
+
       await scaleReaderRef.current?.cancel();
-      scaleReaderRef.current?.releaseLock();
+
+      try {
+        scaleReaderRef.current?.releaseLock();
+      } catch {}
+
+      try {
+        scaleWriterRef.current?.releaseLock();
+      } catch {}
+
       await scalePortRef.current?.close();
     } finally {
       scaleReaderRef.current = null;
+      scaleWriterRef.current = null;
       scalePortRef.current = null;
       setScaleStatus("idle");
       setScaleRawData("Sin datos recibidos todavía.");
