@@ -180,10 +180,22 @@ export function ProductsManager({ initialProducts }: ProductsManagerProps) {
 
     setSaving(true);
     setMessage(null);
-    const { error } = await supabase.from("products").delete().eq("id", product.id);
+
+    const { data, error } = await supabase
+      .from("products")
+      .delete()
+      .eq("id", product.id)
+      .select("id");
 
     if (error) {
+      console.error(error);
       setMessage("No se pudo eliminar el producto.");
+      setSaving(false);
+      return;
+    }
+
+    if (!data || data.length === 0) {
+      setMessage("Supabase no permitió eliminar el producto. Falta permiso DELETE en la tabla products.");
       setSaving(false);
       return;
     }
