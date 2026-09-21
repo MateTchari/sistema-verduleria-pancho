@@ -20,6 +20,7 @@ interface PosClientProps {
 
 const formatCurrency = (value: number) => formatCurrencyValue(value);
 const POS_SESSION_STARTED_AT_KEY = "verduleria-pos-session-started-at";
+const VERDULERIA_SCALE_PORT_KEY = "verduleria-scale-port";
 
 const normalizeSearchText = (value: string) =>
   value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
@@ -267,8 +268,14 @@ export function PosClient({ initialProducts }: PosClientProps) {
     await new Promise((resolve) => window.setTimeout(resolve, 250));
   };
 
-  const connectScale = async () => {
-    const serial = (navigator as Navigator & { serial?: { requestPort: () => Promise<any> } }).serial;
+  const connectScale = async (authorizedOnly = false) => {
+    const serial = (navigator as Navigator & {
+      serial?: {
+        requestPort: () => Promise<any>;
+        getPorts?: () => Promise<any[]>;
+      };
+    }).serial;
+
     if (!serial) {
       setScaleStatus("unsupported");
       return;
@@ -300,16 +307,16 @@ export function PosClient({ initialProducts }: PosClientProps) {
       await sleep(120);
     };
 
-    try {
-      await resetScaleConnection();
+    const portMatchesSaved = (port: any, saved: { usbVendorId?: number; usbProductId?: number } | null) => {
+      if (!saved || typeof port?.getInfo !== "function") return false;
+      const info = port.getInfo?.() ?? {};
+      return (
+        info.usbVendorId === saved.usbVendorId &&
+        info.usbProductId === saved.usbProductId
+      );
+    };
 
-      setScaleStatus("connecting");
-      setScaleRawData("Seleccioná el puerto correcto de la balanza. Liberando cualquier conexión anterior...");
-      setScaleLastWeight(null);
-
-      const port = await serial.requestPort();
-      scalePortRef.current = port;
-
+    const tryPort = async (port: any) => {
       let selectedBaud: number | null = null;
       let selectedCommand: (typeof commands)[number] | null = null;
       let reader: any = null;
@@ -320,7 +327,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
       for (const baudRate of baudRates) {
         for (const command of commands) {
           setScaleRawData(
-            `Probando ${baudRate} baudios con ${command.name}... Esperando respuesta.`
+            `Probando puerto guardado: ${baudRate} baudios con ${command.name}...`
           );
 
           try {
@@ -365,7 +372,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
             reader = null;
             writer = null;
           } catch (error) {
-            console.error(`Error probando ${baudRate} / ${command.name}:`, error);
+            console.error(`Error probando puerto / ${baudRate} / ${command.name}:`, error);
             await closeAttempt(port, reader, writer);
             reader = null;
             writer = null;
@@ -373,19 +380,92 @@ export function PosClient({ initialProducts }: PosClientProps) {
         }
       }
 
-      if (!selectedBaud || !selectedCommand || !reader || !writer || !firstValue) {
+      return { port, selectedBaud, selectedCommand, reader, writer, firstValue };
+    };
+
+    try {
+      await resetScaleConnection();
+
+      setScaleStatus("connecting");
+      setScaleLastWeight(null);
+
+      let savedInfo: { usbVendorId?: number; usbProductId?: number } | null = null;
+      try {
+        savedInfo = JSON.parse(window.localStorage.getItem(VERDULERIA_SCALE_PORT_KEY) ?? "null");
+      } catch {}
+
+      const authorizedPorts = serial.getPorts ? await serial.getPorts() : [];
+      const orderedAuthorizedPorts = [...authorizedPorts].sort((a, b) => {
+        const aMatch = portMatchesSaved(a, savedInfo) ? 1 : 0;
+        const bMatch = portMatchesSaved(b, savedInfo) ? 1 : 0;
+        return bMatch - aMatch;
+      });
+
+      let result: Awaited<ReturnType<typeof tryPort>> | null = null;
+
+      for (const authorizedPort of orderedAuthorizedPorts) {
+        setScaleRawData("Reconectando automáticamente a la balanza guardada...");
+        const attempt = await tryPort(authorizedPort);
+        if (
+          attempt.selectedBaud &&
+          attempt.selectedCommand &&
+          attempt.reader &&
+          attempt.writer &&
+          attempt.firstValue
+        ) {
+          result = attempt;
+          break;
+        }
+      }
+
+      if (!result && authorizedOnly) {
+        setScaleStatus("idle");
+        setScaleRawData("Balanza guardada no disponible. Tocá Conectar balanza para elegirla nuevamente.");
+        return;
+      }
+
+      if (!result) {
+        setScaleRawData("Elegí una sola vez el puerto USB2.0-Ser! de la balanza.");
+        const chosenPort = await serial.requestPort();
+        const attempt = await tryPort(chosenPort);
+
+        if (
+          attempt.selectedBaud &&
+          attempt.selectedCommand &&
+          attempt.reader &&
+          attempt.writer &&
+          attempt.firstValue
+        ) {
+          result = attempt;
+        }
+      }
+
+      if (!result) {
         await resetScaleConnection();
         setScaleStatus("error");
         setScaleRawData(
-          "Ese puerto no respondió. Ya quedó liberado: tocá Conectar balanza otra vez y elegí USB2.0-Ser! (COM3)."
+          "Ese puerto no respondió. Quedó liberado para volver a intentar."
         );
         return;
       }
+
+      const { port, selectedBaud, selectedCommand, reader, writer, firstValue } = result;
 
       scalePortRef.current = port;
       scaleReaderRef.current = reader;
       scaleWriterRef.current = writer;
       setScaleStatus("connected");
+
+      if (typeof port?.getInfo === "function") {
+        const info = port.getInfo?.() ?? {};
+        window.localStorage.setItem(
+          VERDULERIA_SCALE_PORT_KEY,
+          JSON.stringify({
+            usbVendorId: info.usbVendorId,
+            usbProductId: info.usbProductId,
+          })
+        );
+      }
 
       let byteBuffer: number[] = [];
 
@@ -393,7 +473,6 @@ export function PosClient({ initialProducts }: PosClientProps) {
         const incoming = Array.from(value);
         byteBuffer = [...byteBuffer, ...incoming].slice(-120);
 
-        // WACK = peso todavía inestable. No es un peso.
         if (incoming.includes(0x11) && !incoming.includes(0x02)) {
           setScaleRawData(
             `RESPUESTA RECIBIDA — ${selectedBaud} baudios / ${selectedCommand!.name} | WACK: esperando peso estable...`
@@ -403,7 +482,6 @@ export function PosClient({ initialProducts }: PosClientProps) {
         while (true) {
           const stxIndex = byteBuffer.indexOf(0x02);
           if (stxIndex < 0) {
-            // Conservamos sólo un posible WACK y descartamos basura previa.
             byteBuffer = byteBuffer.filter((byte) => byte === 0x11).slice(-1);
             break;
           }
@@ -421,18 +499,14 @@ export function PosClient({ initialProducts }: PosClientProps) {
             .join("")
             .trim();
 
-          // Consumimos STX..ETX y, si ya llegó, también el byte CRC.
           const consume = byteBuffer.length > etxIndex + 1 ? etxIndex + 2 : etxIndex + 1;
           byteBuffer = byteBuffer.slice(consume);
 
           let kilograms: number | null = null;
 
-          // Formato oficial: gramos ASCII sin separador, 6 dígitos.
           if (/^-?\d{6}$/.test(payload)) {
             kilograms = Number(payload) / 1000;
-          }
-          // Algunas revisiones pueden incluir separador decimal.
-          else if (/^-?\d+[.,]\d+$/.test(payload)) {
+          } else if (/^-?\d+[.,]\d+$/.test(payload)) {
             kilograms = Number(payload.replace(",", "."));
           }
 
@@ -488,8 +562,8 @@ export function PosClient({ initialProducts }: PosClientProps) {
       await resetScaleConnection();
       setScaleRawData(
         error instanceof Error
-          ? `${error.message} El puerto fue liberado; podés intentar de nuevo y elegir USB2.0-Ser! (COM3).`
-          : "Error desconocido al conectar o leer la balanza. El puerto fue liberado."
+          ? `${error.message} El puerto fue liberado para volver a intentar.`
+          : "Error desconocido al conectar o leer la balanza."
       );
       setScaleStatus("error");
     }
@@ -501,6 +575,21 @@ export function PosClient({ initialProducts }: PosClientProps) {
     setScaleRawData("Sin datos recibidos todavía.");
     setScaleLastWeight(null);
   };
+
+  useEffect(() => {
+    if (
+      selectedProduct?.unitType !== "peso" ||
+      scaleStatus !== "idle" ||
+      typeof window === "undefined" ||
+      !window.localStorage.getItem(VERDULERIA_SCALE_PORT_KEY)
+    ) {
+      return;
+    }
+
+    void connectScale(true);
+    // Solo reintentamos al abrir un producto por peso.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProductId]);
 
   const changeQuantity = (productId: string, delta: number) => {
     const product = products.find((entry) => entry.id === productId);
