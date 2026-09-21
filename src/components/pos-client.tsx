@@ -272,8 +272,11 @@ export function PosClient({ initialProducts }: PosClientProps) {
     await resetScaleConnection();
 
     setScaleStatus("connecting");
-    setScaleRawData("Abriendo la balanza seleccionada...");
+    setScaleRawData("Probando la balanza elegida...");
     setScaleLastWeight(null);
+
+    let reader: any = null;
+    let writer: any = null;
 
     try {
       await port.open({
@@ -284,18 +287,51 @@ export function PosClient({ initialProducts }: PosClientProps) {
         flowControl: "none",
       });
 
-      const reader = port.readable?.getReader();
-      const writer = port.writable?.getWriter();
+      reader = port.readable?.getReader();
+      writer = port.writable?.getWriter();
 
       if (!reader || !writer) {
         throw new Error("El puerto se abrió pero no permite lectura/escritura.");
+      }
+
+      await writer.write(new Uint8Array([0x05]));
+
+      const firstResult = await Promise.race([
+        reader.read().then((readResult: any) => ({ type: "data" as const, readResult })),
+        new Promise((resolve) =>
+          window.setTimeout(() => resolve({ type: "timeout" as const }), 1500)
+        ),
+      ]);
+
+      if (
+        firstResult.type !== "data" ||
+        firstResult.readResult.done ||
+        !firstResult.readResult.value ||
+        firstResult.readResult.value.length === 0
+      ) {
+        try {
+          await reader.cancel();
+        } catch {}
+        try {
+          reader.releaseLock();
+        } catch {}
+        try {
+          writer.releaseLock();
+        } catch {}
+        try {
+          await port.close();
+        } catch {}
+
+        selectedScalePortRef.current = null;
+        setScaleStatus("error");
+        setScaleRawData("Ese puerto no respondió a la balanza. Elegí el otro puerto.");
+        return;
       }
 
       scalePortRef.current = port;
       scaleReaderRef.current = reader;
       scaleWriterRef.current = writer;
       setScaleStatus("connected");
-      setScaleRawData("Balanza fija conectada a 9600 baudios / ENQ 0x05.");
 
       let byteBuffer: number[] = [];
       let writeInFlight = false;
@@ -351,6 +387,8 @@ export function PosClient({ initialProducts }: PosClientProps) {
         }
       };
 
+      await processIncoming(firstResult.readResult.value as Uint8Array);
+
       const sendEnq = async () => {
         if (writeInFlight) return;
         writeInFlight = true;
@@ -363,25 +401,52 @@ export function PosClient({ initialProducts }: PosClientProps) {
         }
       };
 
-      await sendEnq();
-
       scalePollTimerRef.current = window.setInterval(() => {
         void sendEnq();
       }, 500);
 
+      setScaleRawData((current) =>
+        current.startsWith("Peso recibido") || current.startsWith("Balanza conectada")
+          ? current
+          : "Balanza correcta fijada para esta página."
+      );
+
       while (true) {
         const { value, done } = await reader.read();
-        if (done) break;
+        if (done) {
+          setScaleStatus("error");
+          setScaleRawData("La balanza dejó de responder. Recargá la página para volver a elegirla.");
+          break;
+        }
+
         if (!value || value.length === 0) continue;
         await processIncoming(value as Uint8Array);
       }
     } catch (error) {
       console.error("Error de balanza:", error);
-      await resetScaleConnection();
+
+      try {
+        await reader?.cancel();
+      } catch {}
+      try {
+        reader?.releaseLock();
+      } catch {}
+      try {
+        writer?.releaseLock();
+      } catch {}
+      try {
+        await port?.close();
+      } catch {}
+
+      selectedScalePortRef.current = null;
+      scalePortRef.current = null;
+      scaleReaderRef.current = null;
+      scaleWriterRef.current = null;
+
       setScaleStatus("error");
       setScaleRawData(
         error instanceof Error
-          ? `${error.message} La balanza elegida sigue guardada para esta página.`
+          ? `${error.message} Elegí nuevamente la balanza correcta.`
           : "Error desconocido al conectar la balanza."
       );
     }
@@ -399,29 +464,22 @@ export function PosClient({ initialProducts }: PosClientProps) {
       return;
     }
 
-    let port = selectedScalePortRef.current;
-
-    if (!port) {
-      setScaleRawData("Elegí la balanza una sola vez para esta página.");
-      port = await serial.requestPort();
-      selectedScalePortRef.current = port;
+    if (selectedScalePortRef.current) {
+      await startScaleOnPort(selectedScalePortRef.current);
+      return;
     }
 
+    setScaleRawData("Elegí la balanza correcta. Esto se pide una sola vez mientras la página siga abierta.");
+    const port = await serial.requestPort();
+    selectedScalePortRef.current = port;
     await startScaleOnPort(port);
-  };
-
-  const disconnectScale = async () => {
-    await resetScaleConnection();
-    setScaleStatus("idle");
-    setScaleRawData("Balanza desconectada. Al reconectar se usará la misma balanza elegida.");
-    setScaleLastWeight(null);
   };
 
   const changeScale = async () => {
     await resetScaleConnection();
     selectedScalePortRef.current = null;
     setScaleStatus("idle");
-    setScaleRawData("La próxima conexión te va a pedir elegir balanza nuevamente.");
+    setScaleRawData("Balanza liberada. La próxima conexión te va a pedir elegir otra.");
     setScaleLastWeight(null);
   };
 
@@ -665,48 +723,32 @@ export function PosClient({ initialProducts }: PosClientProps) {
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <p className="text-sm font-medium">Balanza Systel</p>
-                      <p className="text-xs text-slate-500">Se elige una vez por página y queda fija.</p>
+                      <p className="text-xs text-slate-500">Elegís el puerto una vez por cada carga de la página.</p>
                     </div>
 
-                    <div className="flex flex-wrap gap-2">
-                      {scaleStatus === "connected" ? (
-                        <button
-                          type="button"
-                          onClick={() => void disconnectScale()}
-                          className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"
-                        >
-                          Desconectar
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => void connectScale()}
-                          disabled={scaleStatus === "connecting"}
-                          className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50"
-                        >
-                          {scaleStatus === "connecting"
-                            ? "Conectando..."
-                            : selectedScalePortRef.current
-                              ? "Reconectar"
-                              : "Elegir balanza"}
-                        </button>
-                      )}
-
-                      {selectedScalePortRef.current ? (
-                        <button
-                          type="button"
-                          onClick={() => void changeScale()}
-                          className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"
-                        >
-                          Cambiar balanza
-                        </button>
-                      ) : null}
-                    </div>
+                    {scaleStatus !== "connected" ? (
+                      <button
+                        type="button"
+                        onClick={() => void connectScale()}
+                        disabled={scaleStatus === "connecting"}
+                        className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50"
+                      >
+                        {scaleStatus === "connecting" ? "Probando..." : "Elegir balanza"}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => void changeScale()}
+                        className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"
+                      >
+                        Cambiar balanza
+                      </button>
+                    )}
                   </div>
 
                   {scaleStatus === "connected" ? (
                     <p className="mt-2 text-xs text-emerald-700">
-                      Conectada a la balanza fija elegida para esta página.
+                      Balanza correcta fijada. No se volverá a cambiar mientras no recargues la página.
                     </p>
                   ) : null}
 
@@ -718,7 +760,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
 
                   {scaleStatus === "error" ? (
                     <p className="mt-2 text-xs text-rose-700">
-                      Hubo un error de conexión, pero la balanza elegida quedó fija. Tocá Reconectar.
+                      Ese puerto falló o no respondió. Elegí el otro.
                     </p>
                   ) : null}
 
