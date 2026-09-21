@@ -20,7 +20,6 @@ interface PosClientProps {
 
 const formatCurrency = (value: number) => formatCurrencyValue(value);
 const POS_SESSION_STARTED_AT_KEY = "verduleria-pos-session-started-at";
-const VERDULERIA_SCALE_PORT_KEY = "verduleria-scale-port";
 
 const normalizeSearchText = (value: string) =>
   value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
@@ -34,10 +33,8 @@ export function PosClient({ initialProducts }: PosClientProps) {
   const [scaleStatus, setScaleStatus] = useState<"idle" | "connecting" | "connected" | "unsupported" | "error">("idle");
   const [scaleRawData, setScaleRawData] = useState("Sin datos recibidos todavía.");
   const [scaleLastWeight, setScaleLastWeight] = useState<string | null>(null);
-  const [scaleRemembered, setScaleRemembered] = useState(() => {
-    if (typeof window === "undefined") return false;
-    return Boolean(window.localStorage.getItem(VERDULERIA_SCALE_PORT_KEY));
   });
+  const selectedScalePortRef = useRef<any>(null);
   const scalePortRef = useRef<any>(null);
   const scaleReaderRef = useRef<any>(null);
   const scaleWriterRef = useRef<any>(null);
@@ -269,262 +266,47 @@ export function PosClient({ initialProducts }: PosClientProps) {
       await port?.close();
     } catch {}
 
-    await new Promise((resolve) => window.setTimeout(resolve, 250));
+    await new Promise((resolve) => window.setTimeout(resolve, 200));
   };
 
-  const connectScale = async (authorizedOnly = false) => {
-    const serial = (navigator as Navigator & {
-      serial?: {
-        requestPort: () => Promise<any>;
-        getPorts?: () => Promise<any[]>;
-      };
-    }).serial;
+  const startScaleOnPort = async (port: any) => {
+    await resetScaleConnection();
 
-    if (!serial) {
-      setScaleStatus("unsupported");
-      return;
-    }
-
-    const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
-    const baudRates = [9600, 4800, 2400, 19200, 1200];
-    const commands = [
-      { name: "ENQ 0x05", bytes: new Uint8Array([0x05]) },
-      { name: "0x07", bytes: new Uint8Array([0x07]) },
-      { name: "0x07 0x07", bytes: new Uint8Array([0x07, 0x07]) },
-      { name: "P", bytes: new TextEncoder().encode("P") },
-      { name: "W", bytes: new TextEncoder().encode("W") },
-    ];
-
-    const closeAttempt = async (port: any, reader: any, writer: any) => {
-      try {
-        await reader?.cancel();
-      } catch {}
-      try {
-        reader?.releaseLock();
-      } catch {}
-      try {
-        writer?.releaseLock();
-      } catch {}
-      try {
-        await port?.close();
-      } catch {}
-      await sleep(120);
-    };
-
-    const portMatchesSaved = (port: any, saved: { usbVendorId?: number; usbProductId?: number } | null) => {
-      if (!saved || typeof port?.getInfo !== "function") return false;
-      const info = port.getInfo?.() ?? {};
-      return (
-        info.usbVendorId === saved.usbVendorId &&
-        info.usbProductId === saved.usbProductId
-      );
-    };
-
-    const tryPort = async (port: any) => {
-      let selectedBaud: number | null = null;
-      let selectedCommand: (typeof commands)[number] | null = null;
-      let reader: any = null;
-      let writer: any = null;
-      let firstValue: Uint8Array | null = null;
-
-      outer:
-      for (const baudRate of baudRates) {
-        for (const command of commands) {
-          setScaleRawData(
-            `Probando puerto guardado: ${baudRate} baudios con ${command.name}...`
-          );
-
-          try {
-            await port.open({
-              baudRate,
-              dataBits: 8,
-              stopBits: 1,
-              parity: "none",
-              flowControl: "none",
-            });
-
-            reader = port.readable?.getReader();
-            writer = port.writable?.getWriter();
-
-            if (!reader || !writer) {
-              await closeAttempt(port, reader, writer);
-              reader = null;
-              writer = null;
-              continue;
-            }
-
-            await writer.write(command.bytes);
-
-            const result = await Promise.race([
-              reader.read().then((readResult: any) => ({ type: "data" as const, readResult })),
-              sleep(800).then(() => ({ type: "timeout" as const })),
-            ]);
-
-            if (
-              result.type === "data" &&
-              !result.readResult.done &&
-              result.readResult.value &&
-              result.readResult.value.length > 0
-            ) {
-              selectedBaud = baudRate;
-              selectedCommand = command;
-              firstValue = result.readResult.value as Uint8Array;
-              break outer;
-            }
-
-            await closeAttempt(port, reader, writer);
-            reader = null;
-            writer = null;
-          } catch (error) {
-            console.error(`Error probando puerto / ${baudRate} / ${command.name}:`, error);
-            await closeAttempt(port, reader, writer);
-            reader = null;
-            writer = null;
-          }
-        }
-      }
-
-      return { port, selectedBaud, selectedCommand, reader, writer, firstValue };
-    };
-
-    const tryKnownPort = async (port: any) => {
-      let reader: any = null;
-      let writer: any = null;
-
-      try {
-        setScaleRawData("Reconectando automáticamente a la balanza guardada...");
-
-        await port.open({
-          baudRate: 9600,
-          dataBits: 8,
-          stopBits: 1,
-          parity: "none",
-          flowControl: "none",
-        });
-
-        reader = port.readable?.getReader();
-        writer = port.writable?.getWriter();
-
-        if (!reader || !writer) {
-          await closeAttempt(port, reader, writer);
-          return null;
-        }
-
-        const command = commands[0]; // ENQ 0x05, confirmado para esta Systel Croma
-        await writer.write(command.bytes);
-
-        const result = await Promise.race([
-          reader.read().then((readResult: any) => ({ type: "data" as const, readResult })),
-          sleep(1200).then(() => ({ type: "timeout" as const })),
-        ]);
-
-        if (
-          result.type === "data" &&
-          !result.readResult.done &&
-          result.readResult.value &&
-          result.readResult.value.length > 0
-        ) {
-          return {
-            port,
-            selectedBaud: 9600,
-            selectedCommand: command,
-            reader,
-            writer,
-            firstValue: result.readResult.value as Uint8Array,
-          };
-        }
-
-        await closeAttempt(port, reader, writer);
-        return null;
-      } catch (error) {
-        console.error("Error reconectando balanza guardada:", error);
-        await closeAttempt(port, reader, writer);
-        return null;
-      }
-    };
+    setScaleStatus("connecting");
+    setScaleRawData("Abriendo la balanza seleccionada...");
+    setScaleLastWeight(null);
 
     try {
-      await resetScaleConnection();
+      await port.open({
+        baudRate: 9600,
+        dataBits: 8,
+        stopBits: 1,
+        parity: "none",
+        flowControl: "none",
+      });
 
-      setScaleStatus("connecting");
-      setScaleLastWeight(null);
+      const reader = port.readable?.getReader();
+      const writer = port.writable?.getWriter();
 
-      let savedInfo: { usbVendorId?: number; usbProductId?: number } | null = null;
-      try {
-        savedInfo = JSON.parse(window.localStorage.getItem(VERDULERIA_SCALE_PORT_KEY) ?? "null");
-      } catch {}
-
-      const authorizedPorts = serial.getPorts ? await serial.getPorts() : [];
-      let result: Awaited<ReturnType<typeof tryPort>> | null = null;
-
-      if (authorizedOnly && savedInfo) {
-        const rememberedPort = authorizedPorts.find((port) => portMatchesSaved(port, savedInfo));
-
-        if (rememberedPort) {
-          result = await tryKnownPort(rememberedPort);
-        }
-
-        if (!result) {
-          setScaleStatus("error");
-          setScaleRawData("No pude reconectar automáticamente la balanza guardada. Tocá “Cambiar balanza” solo si el cable fue cambiado o desconectado.");
-          return;
-        }
+      if (!reader || !writer) {
+        throw new Error("El puerto se abrió pero no permite lectura/escritura.");
       }
-
-      if (!result) {
-        setScaleRawData("Elegí una sola vez el puerto USB2.0-Ser! de la balanza.");
-        const chosenPort = await serial.requestPort();
-        const attempt = await tryPort(chosenPort);
-
-        if (
-          attempt.selectedBaud &&
-          attempt.selectedCommand &&
-          attempt.reader &&
-          attempt.writer &&
-          attempt.firstValue
-        ) {
-          result = attempt;
-        }
-      }
-
-      if (!result) {
-        await resetScaleConnection();
-        setScaleStatus("error");
-        setScaleRawData(
-          "Ese puerto no respondió. Quedó liberado para volver a intentar."
-        );
-        return;
-      }
-
-      const { port, selectedBaud, selectedCommand, reader, writer, firstValue } = result;
 
       scalePortRef.current = port;
       scaleReaderRef.current = reader;
       scaleWriterRef.current = writer;
       setScaleStatus("connected");
-
-      if (typeof port?.getInfo === "function") {
-        const info = port.getInfo?.() ?? {};
-        window.localStorage.setItem(
-          VERDULERIA_SCALE_PORT_KEY,
-          JSON.stringify({
-            usbVendorId: info.usbVendorId,
-            usbProductId: info.usbProductId,
-          })
-        );
-      }
-      setScaleRemembered(true);
+      setScaleRawData("Balanza fija conectada a 9600 baudios / ENQ 0x05.");
 
       let byteBuffer: number[] = [];
+      let writeInFlight = false;
 
       const processIncoming = async (value: Uint8Array) => {
         const incoming = Array.from(value);
         byteBuffer = [...byteBuffer, ...incoming].slice(-120);
 
         if (incoming.includes(0x11) && !incoming.includes(0x02)) {
-          setScaleRawData(
-            `RESPUESTA RECIBIDA — ${selectedBaud} baudios / ${selectedCommand!.name} | WACK: esperando peso estable...`
-          );
+          setScaleRawData("Balanza conectada. Peso inestable; esperando que se estabilice...");
         }
 
         while (true) {
@@ -542,10 +324,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
           if (etxIndex < 0) break;
 
           const payloadBytes = byteBuffer.slice(1, etxIndex);
-          const payload = payloadBytes
-            .map((byte) => String.fromCharCode(byte))
-            .join("")
-            .trim();
+          const payload = payloadBytes.map((byte) => String.fromCharCode(byte)).join("").trim();
 
           const consume = byteBuffer.length > etxIndex + 1 ? etxIndex + 2 : etxIndex + 1;
           byteBuffer = byteBuffer.slice(consume);
@@ -559,35 +338,25 @@ export function PosClient({ initialProducts }: PosClientProps) {
           }
 
           if (kilograms === null || !Number.isFinite(kilograms) || kilograms < 0) {
-            setScaleRawData(
-              `Trama recibida pero no interpretable: "${payload}". Esperando la próxima...`
-            );
             continue;
           }
 
           const normalizedWeight = kilograms.toFixed(3);
           setManualWeight(normalizedWeight);
           setScaleLastWeight(`${normalizedWeight} kg`);
-          setScaleRawData(
-            `Peso recibido correctamente: ${normalizedWeight} kg — ${selectedBaud} baudios / ${selectedCommand!.name}.`
-          );
+          setScaleRawData(`Peso recibido correctamente: ${normalizedWeight} kg.`);
 
-          if (selectedCommand!.name === "ENQ 0x05") {
-            try {
-              await writer.write(new Uint8Array([0x06]));
-            } catch {}
-          }
+          try {
+            await writer.write(new Uint8Array([0x06]));
+          } catch {}
         }
       };
 
-      await processIncoming(firstValue as Uint8Array);
-
-      let writeInFlight = false;
-      const sendQuery = async () => {
+      const sendEnq = async () => {
         if (writeInFlight) return;
         writeInFlight = true;
         try {
-          await writer.write(selectedCommand!.bytes);
+          await writer.write(new Uint8Array([0x05]));
         } catch (error) {
           console.error("Error consultando peso:", error);
         } finally {
@@ -595,8 +364,10 @@ export function PosClient({ initialProducts }: PosClientProps) {
         }
       };
 
+      await sendEnq();
+
       scalePollTimerRef.current = window.setInterval(() => {
-        void sendQuery();
+        void sendEnq();
       }, 500);
 
       while (true) {
@@ -608,36 +379,52 @@ export function PosClient({ initialProducts }: PosClientProps) {
     } catch (error) {
       console.error("Error de balanza:", error);
       await resetScaleConnection();
+      setScaleStatus("error");
       setScaleRawData(
         error instanceof Error
-          ? `${error.message} El puerto fue liberado para volver a intentar.`
-          : "Error desconocido al conectar o leer la balanza."
+          ? `${error.message} La balanza elegida sigue guardada para esta página.`
+          : "Error desconocido al conectar la balanza."
       );
-      setScaleStatus("error");
     }
+  };
+
+  const connectScale = async () => {
+    const serial = (navigator as Navigator & {
+      serial?: {
+        requestPort: () => Promise<any>;
+      };
+    }).serial;
+
+    if (!serial) {
+      setScaleStatus("unsupported");
+      return;
+    }
+
+    let port = selectedScalePortRef.current;
+
+    if (!port) {
+      setScaleRawData("Elegí la balanza una sola vez para esta página.");
+      port = await serial.requestPort();
+      selectedScalePortRef.current = port;
+    }
+
+    await startScaleOnPort(port);
   };
 
   const disconnectScale = async () => {
     await resetScaleConnection();
     setScaleStatus("idle");
-    setScaleRawData("Sin datos recibidos todavía.");
+    setScaleRawData("Balanza desconectada. Al reconectar se usará la misma balanza elegida.");
     setScaleLastWeight(null);
   };
 
-  useEffect(() => {
-    if (
-      selectedProduct?.unitType !== "peso" ||
-      scaleStatus !== "idle" ||
-      typeof window === "undefined" ||
-      !window.localStorage.getItem(VERDULERIA_SCALE_PORT_KEY)
-    ) {
-      return;
-    }
-
-    void connectScale(true);
-    // Solo reintentamos al abrir un producto por peso.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedProductId]);
+  const changeScale = async () => {
+    await resetScaleConnection();
+    selectedScalePortRef.current = null;
+    setScaleStatus("idle");
+    setScaleRawData("La próxima conexión te va a pedir elegir balanza nuevamente.");
+    setScaleLastWeight(null);
+  };
 
   const changeQuantity = (productId: string, delta: number) => {
     const product = products.find((entry) => entry.id === productId);
@@ -879,31 +666,62 @@ export function PosClient({ initialProducts }: PosClientProps) {
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <p className="text-sm font-medium">Balanza Systel</p>
-                      <p className="text-xs text-slate-500">Configurada para conectarse automáticamente.</p>
+                      <p className="text-xs text-slate-500">Se elige una vez por página y queda fija.</p>
                     </div>
-                    {!scaleRemembered && scaleStatus !== "connected" ? (
-                      <button type="button" onClick={() => void connectScale(false)} disabled={scaleStatus === "connecting"} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50">
-                        {scaleStatus === "connecting" ? "Conectando..." : "Configurar balanza"}
-                      </button>
-                    ) : null}
-                    {scaleRemembered && scaleStatus === "error" ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          window.localStorage.removeItem(VERDULERIA_SCALE_PORT_KEY);
-                          setScaleRemembered(false);
-                          setScaleStatus("idle");
-                          void connectScale(false);
-                        }}
-                        className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"
-                      >
-                        Cambiar balanza
-                      </button>
-                    ) : null}
+
+                    <div className="flex flex-wrap gap-2">
+                      {scaleStatus === "connected" ? (
+                        <button
+                          type="button"
+                          onClick={() => void disconnectScale()}
+                          className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"
+                        >
+                          Desconectar
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => void connectScale()}
+                          disabled={scaleStatus === "connecting"}
+                          className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50"
+                        >
+                          {scaleStatus === "connecting"
+                            ? "Conectando..."
+                            : selectedScalePortRef.current
+                              ? "Reconectar"
+                              : "Elegir balanza"}
+                        </button>
+                      )}
+
+                      {selectedScalePortRef.current ? (
+                        <button
+                          type="button"
+                          onClick={() => void changeScale()}
+                          className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"
+                        >
+                          Cambiar balanza
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
-                  {scaleStatus === "connected" ? <p className="mt-2 text-xs text-emerald-700">Conectada automáticamente. El peso se actualizará solo.</p> : null}
-                  {scaleStatus === "unsupported" ? <p className="mt-2 text-xs text-amber-700">Este navegador no permite conectar balanzas. Usá Chrome o Edge de escritorio.</p> : null}
-                  {scaleStatus === "error" ? <p className="mt-2 text-xs text-rose-700">No se pudo reconectar automáticamente. Revisá que el cable siga conectado.</p> : null}
+
+                  {scaleStatus === "connected" ? (
+                    <p className="mt-2 text-xs text-emerald-700">
+                      Conectada a la balanza fija elegida para esta página.
+                    </p>
+                  ) : null}
+
+                  {scaleStatus === "unsupported" ? (
+                    <p className="mt-2 text-xs text-amber-700">
+                      Este navegador no permite conectar balanzas. Usá Chrome o Edge de escritorio.
+                    </p>
+                  ) : null}
+
+                  {scaleStatus === "error" ? (
+                    <p className="mt-2 text-xs text-rose-700">
+                      Hubo un error de conexión, pero la balanza elegida quedó fija. Tocá Reconectar.
+                    </p>
+                  ) : null}
 
                   {(scaleStatus === "connected" || scaleStatus === "error") ? (
                     <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
