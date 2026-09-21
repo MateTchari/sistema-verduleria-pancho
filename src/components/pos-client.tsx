@@ -34,6 +34,10 @@ export function PosClient({ initialProducts }: PosClientProps) {
   const [scaleStatus, setScaleStatus] = useState<"idle" | "connecting" | "connected" | "unsupported" | "error">("idle");
   const [scaleRawData, setScaleRawData] = useState("Sin datos recibidos todavía.");
   const [scaleLastWeight, setScaleLastWeight] = useState<string | null>(null);
+  const [scaleRemembered, setScaleRemembered] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return Boolean(window.localStorage.getItem(VERDULERIA_SCALE_PORT_KEY));
+  });
   const scalePortRef = useRef<any>(null);
   const scaleReaderRef = useRef<any>(null);
   const scaleWriterRef = useRef<any>(null);
@@ -383,6 +387,62 @@ export function PosClient({ initialProducts }: PosClientProps) {
       return { port, selectedBaud, selectedCommand, reader, writer, firstValue };
     };
 
+    const tryKnownPort = async (port: any) => {
+      let reader: any = null;
+      let writer: any = null;
+
+      try {
+        setScaleRawData("Reconectando automáticamente a la balanza guardada...");
+
+        await port.open({
+          baudRate: 9600,
+          dataBits: 8,
+          stopBits: 1,
+          parity: "none",
+          flowControl: "none",
+        });
+
+        reader = port.readable?.getReader();
+        writer = port.writable?.getWriter();
+
+        if (!reader || !writer) {
+          await closeAttempt(port, reader, writer);
+          return null;
+        }
+
+        const command = commands[0]; // ENQ 0x05, confirmado para esta Systel Croma
+        await writer.write(command.bytes);
+
+        const result = await Promise.race([
+          reader.read().then((readResult: any) => ({ type: "data" as const, readResult })),
+          sleep(1200).then(() => ({ type: "timeout" as const })),
+        ]);
+
+        if (
+          result.type === "data" &&
+          !result.readResult.done &&
+          result.readResult.value &&
+          result.readResult.value.length > 0
+        ) {
+          return {
+            port,
+            selectedBaud: 9600,
+            selectedCommand: command,
+            reader,
+            writer,
+            firstValue: result.readResult.value as Uint8Array,
+          };
+        }
+
+        await closeAttempt(port, reader, writer);
+        return null;
+      } catch (error) {
+        console.error("Error reconectando balanza guardada:", error);
+        await closeAttempt(port, reader, writer);
+        return null;
+      }
+    };
+
     try {
       await resetScaleConnection();
 
@@ -395,33 +455,20 @@ export function PosClient({ initialProducts }: PosClientProps) {
       } catch {}
 
       const authorizedPorts = serial.getPorts ? await serial.getPorts() : [];
-      const orderedAuthorizedPorts = [...authorizedPorts].sort((a, b) => {
-        const aMatch = portMatchesSaved(a, savedInfo) ? 1 : 0;
-        const bMatch = portMatchesSaved(b, savedInfo) ? 1 : 0;
-        return bMatch - aMatch;
-      });
-
       let result: Awaited<ReturnType<typeof tryPort>> | null = null;
 
-      for (const authorizedPort of orderedAuthorizedPorts) {
-        setScaleRawData("Reconectando automáticamente a la balanza guardada...");
-        const attempt = await tryPort(authorizedPort);
-        if (
-          attempt.selectedBaud &&
-          attempt.selectedCommand &&
-          attempt.reader &&
-          attempt.writer &&
-          attempt.firstValue
-        ) {
-          result = attempt;
-          break;
-        }
-      }
+      if (authorizedOnly && savedInfo) {
+        const rememberedPort = authorizedPorts.find((port) => portMatchesSaved(port, savedInfo));
 
-      if (!result && authorizedOnly) {
-        setScaleStatus("idle");
-        setScaleRawData("Balanza guardada no disponible. Tocá Conectar balanza para elegirla nuevamente.");
-        return;
+        if (rememberedPort) {
+          result = await tryKnownPort(rememberedPort);
+        }
+
+        if (!result) {
+          setScaleStatus("error");
+          setScaleRawData("No pude reconectar automáticamente la balanza guardada. Tocá “Cambiar balanza” solo si el cable fue cambiado o desconectado.");
+          return;
+        }
       }
 
       if (!result) {
@@ -466,6 +513,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
           })
         );
       }
+      setScaleRemembered(true);
 
       let byteBuffer: number[] = [];
 
@@ -830,18 +878,32 @@ export function PosClient({ initialProducts }: PosClientProps) {
                 <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
-                      <p className="text-sm font-medium">Balanza conectada</p>
-                      <p className="text-xs text-slate-500">Compatible con balanzas USB/serial que envían el peso como texto.</p>
+                      <p className="text-sm font-medium">Balanza Systel</p>
+                      <p className="text-xs text-slate-500">Configurada para conectarse automáticamente.</p>
                     </div>
-                    {scaleStatus === "connected" ? (
-                      <button type="button" onClick={disconnectScale} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm">Desconectar</button>
-                    ) : (
-                      <button type="button" onClick={() => void connectScale(false)} disabled={scaleStatus === "connecting"} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50">{scaleStatus === "connecting" ? "Conectando..." : "Conectar balanza"}</button>
-                    )}
+                    {!scaleRemembered && scaleStatus !== "connected" ? (
+                      <button type="button" onClick={() => void connectScale(false)} disabled={scaleStatus === "connecting"} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50">
+                        {scaleStatus === "connecting" ? "Conectando..." : "Configurar balanza"}
+                      </button>
+                    ) : null}
+                    {scaleRemembered && scaleStatus === "error" ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          window.localStorage.removeItem(VERDULERIA_SCALE_PORT_KEY);
+                          setScaleRemembered(false);
+                          setScaleStatus("idle");
+                          void connectScale(false);
+                        }}
+                        className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"
+                      >
+                        Cambiar balanza
+                      </button>
+                    ) : null}
                   </div>
-                  {scaleStatus === "connected" ? <p className="mt-2 text-xs text-emerald-700">Balanza conectada: el peso se actualizará automáticamente.</p> : null}
+                  {scaleStatus === "connected" ? <p className="mt-2 text-xs text-emerald-700">Conectada automáticamente. El peso se actualizará solo.</p> : null}
                   {scaleStatus === "unsupported" ? <p className="mt-2 text-xs text-amber-700">Este navegador no permite conectar balanzas. Usá Chrome o Edge de escritorio.</p> : null}
-                  {scaleStatus === "error" ? <p className="mt-2 text-xs text-rose-700">No se pudo conectar o leer la balanza. Revisá el diagnóstico de abajo.</p> : null}
+                  {scaleStatus === "error" ? <p className="mt-2 text-xs text-rose-700">No se pudo reconectar automáticamente. Revisá que el cable siga conectado.</p> : null}
 
                   {(scaleStatus === "connected" || scaleStatus === "error") ? (
                     <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
