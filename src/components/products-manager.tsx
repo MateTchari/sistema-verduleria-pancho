@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 
 interface ProductRow {
@@ -35,6 +35,64 @@ export function ProductsManager({ initialProducts }: ProductsManagerProps) {
   const [form, setForm] = useState({ ...emptyForm, active: true });
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+
+    const loadProducts = async () => {
+      const { data, error } = await supabase
+        .from("products")
+        .select("*")
+        .order("name");
+
+      if (error) {
+        console.error("Error sincronizando productos con Supabase:", error);
+        return;
+      }
+
+      if (!data || !active) return;
+
+      setProducts(
+        data.map((product: any) => ({
+          id: product.id,
+          name: product.name,
+          category: product.category,
+          price: Number(product.price ?? 0),
+          stock: Number(product.stock ?? 0),
+          minStock: Number(product.min_stock ?? 0),
+          unitType: (product.unit_type as "unidad" | "peso") ?? "peso",
+          active: Boolean(product.active),
+        }))
+      );
+    };
+
+    void loadProducts();
+
+    const channel = supabase
+      .channel("products-manager-realtime")
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "products",
+        },
+        () => {
+          void loadProducts();
+        }
+      )
+      .subscribe();
+
+    const fallbackRefresh = window.setInterval(() => {
+      void loadProducts();
+    }, 5000);
+
+    return () => {
+      active = false;
+      window.clearInterval(fallbackRefresh);
+      void supabase.removeChannel(channel);
+    };
+  }, []);
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
