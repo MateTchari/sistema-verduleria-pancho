@@ -271,76 +271,94 @@ export function PosClient({ initialProducts }: PosClientProps) {
       setScaleStatus("connected");
 
       let buffer: number[] = [];
-      let waitingResponse = false;
+      let writeInFlight = false;
 
       const sendEnq = async () => {
-        if (waitingResponse) return;
-
+        if (writeInFlight) return;
+        writeInFlight = true;
         try {
-          waitingResponse = true;
           await writer.write(new Uint8Array([0x05]));
         } catch (error) {
-          waitingResponse = false;
           console.error("Error enviando ENQ a la balanza:", error);
+        } finally {
+          writeInFlight = false;
         }
       };
 
-      setScaleRawData("Conectada a 9600 baudios. Protocolo Systel ENQ (0x05). Esperando peso estable...");
+      const xorCrc = (bytes: number[]) =>
+        bytes.reduce((crc, byte) => crc ^ byte, 0);
 
-      await sendEnq();
+      const tryParseFrames = async () => {
+        while (buffer.length > 0) {
+          // WACK puede llegar entre consultas. Lo descartamos sin tomarlo como peso.
+          if (buffer[0] === 0x11) {
+            buffer.shift();
+            setScaleRawData("Balanza conectada. Peso inestable; esperando que se estabilice...");
+            continue;
+          }
 
-      scalePollTimerRef.current = window.setInterval(() => {
-        void sendEnq();
-      }, 500);
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (!value || value.length === 0) continue;
-
-        const incoming = Array.from(value as Uint8Array);
-
-        // WACK (0x11): la balanza todavía no tiene un peso estable.
-        if (incoming.length === 1 && incoming[0] === 0x11) {
-          waitingResponse = false;
-          setScaleRawData("Balanza conectada. Peso inestable; esperando que se estabilice...");
-          continue;
-        }
-
-        buffer.push(...incoming);
-
-        // Evitamos que datos viejos o corruptos se acumulen indefinidamente.
-        if (buffer.length > 64) {
-          const lastStx = buffer.lastIndexOf(0x02);
-          buffer = lastStx >= 0 ? buffer.slice(lastStx) : [];
-        }
-
-        while (true) {
           const stxIndex = buffer.indexOf(0x02);
           if (stxIndex < 0) {
             buffer = [];
-            break;
+            return;
           }
 
           if (stxIndex > 0) {
             buffer = buffer.slice(stxIndex);
           }
 
-          const etxIndex = buffer.indexOf(0x03, 1);
-          if (etxIndex < 0) break;
+          // Formato oficial: STX + PESO(6 o 7 ASCII) + ETX + CRC.
+          // Esperamos la trama completa antes de interpretarla.
+          if (buffer.length < 9) return;
 
-          const payloadBytes = buffer.slice(1, etxIndex);
-          const payload = payloadBytes.map((byte) => String.fromCharCode(byte)).join("");
+          let payloadLength: 6 | 7 | null = null;
 
-          // Consumimos también el CRC si ya llegó.
-          const bytesToConsume = buffer.length > etxIndex + 1 ? etxIndex + 2 : etxIndex + 1;
-          buffer = buffer.slice(bytesToConsume);
-          waitingResponse = false;
+          if (buffer.length >= 9 && buffer[7] === 0x03) {
+            payloadLength = 6;
+          } else if (buffer.length >= 10 && buffer[8] === 0x03) {
+            payloadLength = 7;
+          } else {
+            // Si no coincide con ninguna longitud válida, descartamos este STX
+            // y buscamos el próximo para no concatenar basura.
+            buffer.shift();
+            continue;
+          }
 
-          // Según Systel, PESO son 6 caracteres ASCII, o 7 si es negativo.
+          const etxIndex = 1 + payloadLength;
+          const crcIndex = etxIndex + 1;
+
+          if (buffer.length <= crcIndex) return;
+
+          const frame = buffer.slice(0, crcIndex + 1);
+          const payloadBytes = frame.slice(1, etxIndex);
+          const receivedCrc = frame[crcIndex];
+          const calculatedCrc = xorCrc(frame.slice(0, etxIndex + 1));
+
+          buffer = buffer.slice(crcIndex + 1);
+
+          const payload = payloadBytes
+            .map((byte) => String.fromCharCode(byte))
+            .join("");
+
+          if (receivedCrc !== calculatedCrc) {
+            setScaleRawData(
+              `Trama descartada por CRC inválido. Recibido ${receivedCrc
+                .toString(16)
+                .padStart(2, "0")
+                .toUpperCase()}, esperado ${calculatedCrc
+                .toString(16)
+                .padStart(2, "0")
+                .toUpperCase()}.`
+            );
+            try {
+              await writer.write(new Uint8Array([0x15]));
+            } catch {}
+            continue;
+          }
+
           if (!/^-?\d{6}$/.test(payload)) {
             setScaleRawData(
-              `Trama recibida pero inválida: "${payload}". Esperando la próxima lectura válida...`
+              `Trama válida pero peso inesperado: "${payload}". Esperando próxima lectura...`
             );
             continue;
           }
@@ -348,21 +366,43 @@ export function PosClient({ initialProducts }: PosClientProps) {
           const grams = Number(payload);
           if (!Number.isFinite(grams)) continue;
 
-          const kilograms = grams / 1000;
-          const normalizedWeight = kilograms.toFixed(3);
-
+          const normalizedWeight = (grams / 1000).toFixed(3);
           setManualWeight(normalizedWeight);
           setScaleLastWeight(`${normalizedWeight} kg`);
           setScaleRawData(
-            `Peso recibido correctamente: ${normalizedWeight} kg (protocolo Systel 9600 / ENQ 0x05).`
+            `Peso recibido correctamente: ${normalizedWeight} kg — Systel Croma / 9600 / ENQ 0x05.`
           );
 
           try {
             await writer.write(new Uint8Array([0x06]));
           } catch (error) {
-            console.error("No se pudo enviar ACK a la balanza:", error);
+            console.error("No se pudo enviar ACK:", error);
           }
         }
+      };
+
+      setScaleRawData("Conectada a 9600 baudios. Usando únicamente ENQ 0x05.");
+
+      await sendEnq();
+
+      scalePollTimerRef.current = window.setInterval(() => {
+        void sendEnq();
+      }, 700);
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value || value.length === 0) continue;
+
+        buffer.push(...Array.from(value as Uint8Array));
+
+        // Límite defensivo para evitar acumulaciones infinitas.
+        if (buffer.length > 128) {
+          const lastStx = buffer.lastIndexOf(0x02);
+          buffer = lastStx >= 0 ? buffer.slice(lastStx) : [];
+        }
+
+        await tryParseFrames();
       }
     } catch (error) {
       console.error("Error de balanza:", error);
