@@ -532,7 +532,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
         }
       };
 
-      await processIncoming(firstValue);
+      await processIncoming(firstValue as Uint8Array);
 
       let writeInFlight = false;
       const sendQuery = async () => {
@@ -836,7 +836,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
                     {scaleStatus === "connected" ? (
                       <button type="button" onClick={disconnectScale} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm">Desconectar</button>
                     ) : (
-                      <button type="button" onClick={connectScale} disabled={scaleStatus === "connecting"} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50">{scaleStatus === "connecting" ? "Conectando..." : "Conectar balanza"}</button>
+                      <button type="button" onClick={() => void connectScale(false)} disabled={scaleStatus === "connecting"} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50">{scaleStatus === "connecting" ? "Conectando..." : "Conectar balanza"}</button>
                     )}
                   </div>
                   {scaleStatus === "connected" ? <p className="mt-2 text-xs text-emerald-700">Balanza conectada: el peso se actualizará automáticamente.</p> : null}
