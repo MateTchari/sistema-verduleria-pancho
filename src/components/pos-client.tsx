@@ -241,27 +241,110 @@ export function PosClient({ initialProducts }: PosClientProps) {
       return;
     }
 
+    const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+    const baudRates = [9600, 4800, 2400, 19200, 1200];
+    const commands = [
+      { name: "ENQ 0x05", bytes: new Uint8Array([0x05]) },
+      { name: "0x07", bytes: new Uint8Array([0x07]) },
+      { name: "0x07 0x07", bytes: new Uint8Array([0x07, 0x07]) },
+      { name: "P", bytes: new TextEncoder().encode("P") },
+      { name: "W", bytes: new TextEncoder().encode("W") },
+    ];
+
+    const closeAttempt = async (port: any, reader: any, writer: any) => {
+      try {
+        await reader?.cancel();
+      } catch {}
+      try {
+        reader?.releaseLock();
+      } catch {}
+      try {
+        writer?.releaseLock();
+      } catch {}
+      try {
+        await port?.close();
+      } catch {}
+      await sleep(120);
+    };
+
     try {
       setScaleStatus("connecting");
-      setScaleRawData("Abriendo puerto de la balanza Systel...");
+      setScaleRawData("Seleccioná el puerto de la balanza. Voy a probar velocidades automáticamente...");
       setScaleLastWeight(null);
 
       const port = await serial.requestPort();
 
-      await port.open({
-        baudRate: 9600,
-        dataBits: 8,
-        stopBits: 1,
-        parity: "none",
-        flowControl: "none",
-      });
+      let selectedBaud: number | null = null;
+      let selectedCommand: (typeof commands)[number] | null = null;
+      let reader: any = null;
+      let writer: any = null;
+      let firstValue: Uint8Array | null = null;
 
-      const reader = port.readable?.getReader();
-      const writer = port.writable?.getWriter();
+      outer:
+      for (const baudRate of baudRates) {
+        for (const command of commands) {
+          setScaleRawData(
+            `Probando ${baudRate} baudios con ${command.name}... Esperando respuesta.`
+          );
 
-      if (!reader || !writer) {
-        setScaleRawData("El puerto se abrió, pero no permite lectura/escritura.");
+          try {
+            await port.open({
+              baudRate,
+              dataBits: 8,
+              stopBits: 1,
+              parity: "none",
+              flowControl: "none",
+            });
+
+            reader = port.readable?.getReader();
+            writer = port.writable?.getWriter();
+
+            if (!reader || !writer) {
+              await closeAttempt(port, reader, writer);
+              reader = null;
+              writer = null;
+              continue;
+            }
+
+            await writer.write(command.bytes);
+
+            const result = await Promise.race([
+              reader.read().then((readResult: any) => ({ type: "data" as const, readResult })),
+              sleep(800).then(() => ({ type: "timeout" as const })),
+            ]);
+
+            if (
+              result.type === "data" &&
+              !result.readResult.done &&
+              result.readResult.value &&
+              result.readResult.value.length > 0
+            ) {
+              selectedBaud = baudRate;
+              selectedCommand = command;
+              firstValue = result.readResult.value as Uint8Array;
+              break outer;
+            }
+
+            await closeAttempt(port, reader, writer);
+            reader = null;
+            writer = null;
+          } catch (error) {
+            console.error(`Error probando ${baudRate} / ${command.name}:`, error);
+            await closeAttempt(port, reader, writer);
+            reader = null;
+            writer = null;
+          }
+        }
+      }
+
+      if (!selectedBaud || !selectedCommand || !reader || !writer || !firstValue) {
+        scalePortRef.current = null;
+        scaleReaderRef.current = null;
+        scaleWriterRef.current = null;
         setScaleStatus("error");
+        setScaleRawData(
+          "No hubo respuesta en 9600, 4800, 2400, 19200 ni 1200 baudios con ninguno de los protocolos probados."
+        );
         return;
       }
 
@@ -270,139 +353,101 @@ export function PosClient({ initialProducts }: PosClientProps) {
       scaleWriterRef.current = writer;
       setScaleStatus("connected");
 
-      let buffer: number[] = [];
-      let writeInFlight = false;
+      let byteBuffer: number[] = [];
 
-      const sendEnq = async () => {
+      const processIncoming = async (value: Uint8Array) => {
+        const incoming = Array.from(value);
+        byteBuffer = [...byteBuffer, ...incoming].slice(-120);
+
+        // WACK = peso todavía inestable. No es un peso.
+        if (incoming.includes(0x11) && !incoming.includes(0x02)) {
+          setScaleRawData(
+            `RESPUESTA RECIBIDA — ${selectedBaud} baudios / ${selectedCommand!.name} | WACK: esperando peso estable...`
+          );
+        }
+
+        while (true) {
+          const stxIndex = byteBuffer.indexOf(0x02);
+          if (stxIndex < 0) {
+            // Conservamos sólo un posible WACK y descartamos basura previa.
+            byteBuffer = byteBuffer.filter((byte) => byte === 0x11).slice(-1);
+            break;
+          }
+
+          if (stxIndex > 0) {
+            byteBuffer = byteBuffer.slice(stxIndex);
+          }
+
+          const etxIndex = byteBuffer.indexOf(0x03, 1);
+          if (etxIndex < 0) break;
+
+          const payloadBytes = byteBuffer.slice(1, etxIndex);
+          const payload = payloadBytes
+            .map((byte) => String.fromCharCode(byte))
+            .join("")
+            .trim();
+
+          // Consumimos STX..ETX y, si ya llegó, también el byte CRC.
+          const consume = byteBuffer.length > etxIndex + 1 ? etxIndex + 2 : etxIndex + 1;
+          byteBuffer = byteBuffer.slice(consume);
+
+          let kilograms: number | null = null;
+
+          // Formato oficial: gramos ASCII sin separador, 6 dígitos.
+          if (/^-?\d{6}$/.test(payload)) {
+            kilograms = Number(payload) / 1000;
+          }
+          // Algunas revisiones pueden incluir separador decimal.
+          else if (/^-?\d+[.,]\d+$/.test(payload)) {
+            kilograms = Number(payload.replace(",", "."));
+          }
+
+          if (kilograms === null || !Number.isFinite(kilograms) || kilograms < 0) {
+            setScaleRawData(
+              `Trama recibida pero no interpretable: "${payload}". Esperando la próxima...`
+            );
+            continue;
+          }
+
+          const normalizedWeight = kilograms.toFixed(3);
+          setManualWeight(normalizedWeight);
+          setScaleLastWeight(`${normalizedWeight} kg`);
+          setScaleRawData(
+            `Peso recibido correctamente: ${normalizedWeight} kg — ${selectedBaud} baudios / ${selectedCommand!.name}.`
+          );
+
+          if (selectedCommand!.name === "ENQ 0x05") {
+            try {
+              await writer.write(new Uint8Array([0x06]));
+            } catch {}
+          }
+        }
+      };
+
+      await processIncoming(firstValue);
+
+      let writeInFlight = false;
+      const sendQuery = async () => {
         if (writeInFlight) return;
         writeInFlight = true;
         try {
-          await writer.write(new Uint8Array([0x05]));
+          await writer.write(selectedCommand!.bytes);
         } catch (error) {
-          console.error("Error enviando ENQ a la balanza:", error);
+          console.error("Error consultando peso:", error);
         } finally {
           writeInFlight = false;
         }
       };
 
-      const xorCrc = (bytes: number[]) =>
-        bytes.reduce((crc, byte) => crc ^ byte, 0);
-
-      const tryParseFrames = async () => {
-        while (buffer.length > 0) {
-          // WACK puede llegar entre consultas. Lo descartamos sin tomarlo como peso.
-          if (buffer[0] === 0x11) {
-            buffer.shift();
-            setScaleRawData("Balanza conectada. Peso inestable; esperando que se estabilice...");
-            continue;
-          }
-
-          const stxIndex = buffer.indexOf(0x02);
-          if (stxIndex < 0) {
-            buffer = [];
-            return;
-          }
-
-          if (stxIndex > 0) {
-            buffer = buffer.slice(stxIndex);
-          }
-
-          // Formato oficial: STX + PESO(6 o 7 ASCII) + ETX + CRC.
-          // Esperamos la trama completa antes de interpretarla.
-          if (buffer.length < 9) return;
-
-          let payloadLength: 6 | 7 | null = null;
-
-          if (buffer.length >= 9 && buffer[7] === 0x03) {
-            payloadLength = 6;
-          } else if (buffer.length >= 10 && buffer[8] === 0x03) {
-            payloadLength = 7;
-          } else {
-            // Si no coincide con ninguna longitud válida, descartamos este STX
-            // y buscamos el próximo para no concatenar basura.
-            buffer.shift();
-            continue;
-          }
-
-          const etxIndex = 1 + payloadLength;
-          const crcIndex = etxIndex + 1;
-
-          if (buffer.length <= crcIndex) return;
-
-          const frame = buffer.slice(0, crcIndex + 1);
-          const payloadBytes = frame.slice(1, etxIndex);
-          const receivedCrc = frame[crcIndex];
-          const calculatedCrc = xorCrc(frame.slice(0, etxIndex + 1));
-
-          buffer = buffer.slice(crcIndex + 1);
-
-          const payload = payloadBytes
-            .map((byte) => String.fromCharCode(byte))
-            .join("");
-
-          if (receivedCrc !== calculatedCrc) {
-            setScaleRawData(
-              `Trama descartada por CRC inválido. Recibido ${receivedCrc
-                .toString(16)
-                .padStart(2, "0")
-                .toUpperCase()}, esperado ${calculatedCrc
-                .toString(16)
-                .padStart(2, "0")
-                .toUpperCase()}.`
-            );
-            try {
-              await writer.write(new Uint8Array([0x15]));
-            } catch {}
-            continue;
-          }
-
-          if (!/^-?\d{6}$/.test(payload)) {
-            setScaleRawData(
-              `Trama válida pero peso inesperado: "${payload}". Esperando próxima lectura...`
-            );
-            continue;
-          }
-
-          const grams = Number(payload);
-          if (!Number.isFinite(grams)) continue;
-
-          const normalizedWeight = (grams / 1000).toFixed(3);
-          setManualWeight(normalizedWeight);
-          setScaleLastWeight(`${normalizedWeight} kg`);
-          setScaleRawData(
-            `Peso recibido correctamente: ${normalizedWeight} kg — Systel Croma / 9600 / ENQ 0x05.`
-          );
-
-          try {
-            await writer.write(new Uint8Array([0x06]));
-          } catch (error) {
-            console.error("No se pudo enviar ACK:", error);
-          }
-        }
-      };
-
-      setScaleRawData("Conectada a 9600 baudios. Usando únicamente ENQ 0x05.");
-
-      await sendEnq();
-
       scalePollTimerRef.current = window.setInterval(() => {
-        void sendEnq();
-      }, 700);
+        void sendQuery();
+      }, 500);
 
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
         if (!value || value.length === 0) continue;
-
-        buffer.push(...Array.from(value as Uint8Array));
-
-        // Límite defensivo para evitar acumulaciones infinitas.
-        if (buffer.length > 128) {
-          const lastStx = buffer.lastIndexOf(0x02);
-          buffer = lastStx >= 0 ? buffer.slice(lastStx) : [];
-        }
-
-        await tryParseFrames();
+        await processIncoming(value as Uint8Array);
       }
     } catch (error) {
       console.error("Error de balanza:", error);
