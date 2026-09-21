@@ -234,6 +234,39 @@ export function PosClient({ initialProducts }: PosClientProps) {
     setManualWeight("");
   };
 
+  const resetScaleConnection = async () => {
+    if (scalePollTimerRef.current !== null) {
+      window.clearInterval(scalePollTimerRef.current);
+      scalePollTimerRef.current = null;
+    }
+
+    const reader = scaleReaderRef.current;
+    const writer = scaleWriterRef.current;
+    const port = scalePortRef.current;
+
+    scaleReaderRef.current = null;
+    scaleWriterRef.current = null;
+    scalePortRef.current = null;
+
+    try {
+      await reader?.cancel();
+    } catch {}
+
+    try {
+      reader?.releaseLock();
+    } catch {}
+
+    try {
+      writer?.releaseLock();
+    } catch {}
+
+    try {
+      await port?.close();
+    } catch {}
+
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+  };
+
   const connectScale = async () => {
     const serial = (navigator as Navigator & { serial?: { requestPort: () => Promise<any> } }).serial;
     if (!serial) {
@@ -268,11 +301,14 @@ export function PosClient({ initialProducts }: PosClientProps) {
     };
 
     try {
+      await resetScaleConnection();
+
       setScaleStatus("connecting");
-      setScaleRawData("Seleccioná el puerto de la balanza. Voy a probar velocidades automáticamente...");
+      setScaleRawData("Seleccioná el puerto correcto de la balanza. Liberando cualquier conexión anterior...");
       setScaleLastWeight(null);
 
       const port = await serial.requestPort();
+      scalePortRef.current = port;
 
       let selectedBaud: number | null = null;
       let selectedCommand: (typeof commands)[number] | null = null;
@@ -338,12 +374,10 @@ export function PosClient({ initialProducts }: PosClientProps) {
       }
 
       if (!selectedBaud || !selectedCommand || !reader || !writer || !firstValue) {
-        scalePortRef.current = null;
-        scaleReaderRef.current = null;
-        scaleWriterRef.current = null;
+        await resetScaleConnection();
         setScaleStatus("error");
         setScaleRawData(
-          "No hubo respuesta en 9600, 4800, 2400, 19200 ni 1200 baudios con ninguno de los protocolos probados."
+          "Ese puerto no respondió. Ya quedó liberado: tocá Conectar balanza otra vez y elegí USB2.0-Ser! (COM3)."
         );
         return;
       }
@@ -451,41 +485,21 @@ export function PosClient({ initialProducts }: PosClientProps) {
       }
     } catch (error) {
       console.error("Error de balanza:", error);
+      await resetScaleConnection();
       setScaleRawData(
         error instanceof Error
-          ? error.message
-          : "Error desconocido al conectar o leer la balanza."
+          ? `${error.message} El puerto fue liberado; podés intentar de nuevo y elegir USB2.0-Ser! (COM3).`
+          : "Error desconocido al conectar o leer la balanza. El puerto fue liberado."
       );
       setScaleStatus("error");
     }
   };
 
   const disconnectScale = async () => {
-    try {
-      if (scalePollTimerRef.current !== null) {
-        window.clearInterval(scalePollTimerRef.current);
-        scalePollTimerRef.current = null;
-      }
-
-      await scaleReaderRef.current?.cancel();
-
-      try {
-        scaleReaderRef.current?.releaseLock();
-      } catch {}
-
-      try {
-        scaleWriterRef.current?.releaseLock();
-      } catch {}
-
-      await scalePortRef.current?.close();
-    } finally {
-      scaleReaderRef.current = null;
-      scaleWriterRef.current = null;
-      scalePortRef.current = null;
-      setScaleStatus("idle");
-      setScaleRawData("Sin datos recibidos todavía.");
-      setScaleLastWeight(null);
-    }
+    await resetScaleConnection();
+    setScaleStatus("idle");
+    setScaleRawData("Sin datos recibidos todavía.");
+    setScaleLastWeight(null);
   };
 
   const changeQuantity = (productId: string, delta: number) => {
