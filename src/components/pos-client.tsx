@@ -241,94 +241,122 @@ export function PosClient({ initialProducts }: PosClientProps) {
       return;
     }
 
+    const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+    const baudRates = [9600, 4800, 2400, 19200, 1200];
+    const commands = [
+      { name: "ENQ 0x05", bytes: new Uint8Array([0x05]) },
+      { name: "0x07", bytes: new Uint8Array([0x07]) },
+      { name: "0x07 0x07", bytes: new Uint8Array([0x07, 0x07]) },
+      { name: "P", bytes: new TextEncoder().encode("P") },
+      { name: "W", bytes: new TextEncoder().encode("W") },
+    ];
+
+    const closeAttempt = async (port: any, reader: any, writer: any) => {
+      try {
+        await reader?.cancel();
+      } catch {}
+      try {
+        reader?.releaseLock();
+      } catch {}
+      try {
+        writer?.releaseLock();
+      } catch {}
+      try {
+        await port?.close();
+      } catch {}
+      await sleep(120);
+    };
+
     try {
       setScaleStatus("connecting");
-      setScaleRawData("Abriendo puerto serial...");
+      setScaleRawData("Seleccioná el puerto de la balanza. Voy a probar velocidades automáticamente...");
       setScaleLastWeight(null);
 
       const port = await serial.requestPort();
-      await port.open({
-        baudRate: 9600,
-        dataBits: 8,
-        stopBits: 1,
-        parity: "none",
-        flowControl: "none",
-      });
 
-      scalePortRef.current = port;
+      let selectedBaud: number | null = null;
+      let selectedCommand: (typeof commands)[number] | null = null;
+      let reader: any = null;
+      let writer: any = null;
+      let firstValue: Uint8Array | null = null;
 
-      const reader = port.readable?.getReader();
-      const writer = port.writable?.getWriter();
+      outer:
+      for (const baudRate of baudRates) {
+        for (const command of commands) {
+          setScaleRawData(
+            `Probando ${baudRate} baudios con ${command.name}... Esperando respuesta.`
+          );
 
-      if (!reader || !writer) {
-        setScaleRawData("El puerto se abrió, pero no permite lectura/escritura.");
+          try {
+            await port.open({
+              baudRate,
+              dataBits: 8,
+              stopBits: 1,
+              parity: "none",
+              flowControl: "none",
+            });
+
+            reader = port.readable?.getReader();
+            writer = port.writable?.getWriter();
+
+            if (!reader || !writer) {
+              await closeAttempt(port, reader, writer);
+              reader = null;
+              writer = null;
+              continue;
+            }
+
+            await writer.write(command.bytes);
+
+            const result = await Promise.race([
+              reader.read().then((readResult: any) => ({ type: "data" as const, readResult })),
+              sleep(800).then(() => ({ type: "timeout" as const })),
+            ]);
+
+            if (
+              result.type === "data" &&
+              !result.readResult.done &&
+              result.readResult.value &&
+              result.readResult.value.length > 0
+            ) {
+              selectedBaud = baudRate;
+              selectedCommand = command;
+              firstValue = result.readResult.value as Uint8Array;
+              break outer;
+            }
+
+            await closeAttempt(port, reader, writer);
+            reader = null;
+            writer = null;
+          } catch (error) {
+            console.error(`Error probando ${baudRate} / ${command.name}:`, error);
+            await closeAttempt(port, reader, writer);
+            reader = null;
+            writer = null;
+          }
+        }
+      }
+
+      if (!selectedBaud || !selectedCommand || !reader || !writer || !firstValue) {
+        scalePortRef.current = null;
+        scaleReaderRef.current = null;
+        scaleWriterRef.current = null;
         setScaleStatus("error");
+        setScaleRawData(
+          "No hubo respuesta en 9600, 4800, 2400, 19200 ni 1200 baudios con ninguno de los protocolos probados."
+        );
         return;
       }
 
+      scalePortRef.current = port;
       scaleReaderRef.current = reader;
       scaleWriterRef.current = writer;
       setScaleStatus("connected");
 
-      const commands = [
-        { name: "ENQ 0x05", bytes: new Uint8Array([0x05]) },
-        { name: "0x07", bytes: new Uint8Array([0x07]) },
-        { name: "0x07 0x07", bytes: new Uint8Array([0x07, 0x07]) },
-        { name: "P", bytes: new TextEncoder().encode("P") },
-        { name: "W", bytes: new TextEncoder().encode("W") },
-      ];
-
-      let attempts = 0;
-      let lastCommandIndex = 0;
-      let successfulCommandIndex: number | null = null;
-      let receivedData = false;
-      let writeInFlight = false;
       let byteBuffer: number[] = [];
 
-      const sendQuery = async () => {
-        if (writeInFlight) return;
-        writeInFlight = true;
-
-        try {
-          const commandIndex =
-            successfulCommandIndex ?? Math.floor(attempts / 4) % commands.length;
-
-          lastCommandIndex = commandIndex;
-          const command = commands[commandIndex];
-
-          await writer.write(command.bytes);
-          attempts += 1;
-
-          if (!receivedData) {
-            setScaleRawData(
-              `Puerto conectado a 9600 baudios. Consultando peso con ${command.name}...`
-            );
-          }
-        } catch (error) {
-          console.error("Error enviando consulta a la balanza:", error);
-        } finally {
-          writeInFlight = false;
-        }
-      };
-
-      await sendQuery();
-
-      scalePollTimerRef.current = window.setInterval(() => {
-        void sendQuery();
-      }, 500);
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (!value || value.length === 0) continue;
-
-        receivedData = true;
-
-        if (successfulCommandIndex === null) {
-          successfulCommandIndex = lastCommandIndex;
-        }
-
-        const incoming = Array.from(value as Uint8Array);
+      const processIncoming = async (value: Uint8Array) => {
+        const incoming = Array.from(value);
         byteBuffer = [...byteBuffer, ...incoming].slice(-240);
 
         const ascii = byteBuffer
@@ -341,11 +369,9 @@ export function PosClient({ initialProducts }: PosClientProps) {
           .join(" ");
 
         setScaleRawData(
-          `Protocolo: ${commands[successfulCommandIndex].name} | HEX: ${hex}${ascii ? ` | ASCII: ${ascii.slice(-120)}` : ""}`
+          `RESPUESTA RECIBIDA — ${selectedBaud} baudios / ${selectedCommand!.name} | HEX: ${hex}${ascii ? ` | ASCII: ${ascii.slice(-120)}` : ""}`
         );
 
-        // Croma/Clipse suelen devolver el peso en gramos como ASCII.
-        // Ejemplo: "000750" => 0.750 kg.
         const matches = ascii.match(/-?\d+(?:[.,]\d+)?/g);
         if (matches?.length) {
           const rawWeight = matches.at(-1) ?? "";
@@ -361,34 +387,47 @@ export function PosClient({ initialProducts }: PosClientProps) {
               setManualWeight(normalizedWeight);
               setScaleLastWeight(`${normalizedWeight} kg`);
 
-              // El protocolo clásico solicita ACK luego de una trama válida.
-              if (successfulCommandIndex === 0) {
+              if (selectedCommand!.name === "ENQ 0x05") {
                 try {
                   await writer.write(new Uint8Array([0x06]));
-                } catch (error) {
-                  console.error("No se pudo enviar ACK a la balanza:", error);
-                }
+                } catch {}
               }
             }
           }
         }
 
-        // WACK (0x11) significa "espere"; el polling vuelve a consultar solo.
         if (incoming.includes(0x11)) {
           setScaleRawData(
-            `Protocolo: ${commands[successfulCommandIndex].name} | La balanza pidió espera (WACK). Reintentando...`
+            `RESPUESTA RECIBIDA — ${selectedBaud} baudios / ${selectedCommand!.name} | WACK: la balanza pidió espera. Reintentando...`
           );
         }
-      }
+      };
 
-      if (scalePollTimerRef.current !== null) {
-        window.clearInterval(scalePollTimerRef.current);
-        scalePollTimerRef.current = null;
-      }
+      await processIncoming(firstValue);
 
-      setScaleRawData((current) =>
-        receivedData ? current : "La conexión terminó sin recibir datos de la balanza."
-      );
+      let writeInFlight = false;
+      const sendQuery = async () => {
+        if (writeInFlight) return;
+        writeInFlight = true;
+        try {
+          await writer.write(selectedCommand!.bytes);
+        } catch (error) {
+          console.error("Error consultando peso:", error);
+        } finally {
+          writeInFlight = false;
+        }
+      };
+
+      scalePollTimerRef.current = window.setInterval(() => {
+        void sendQuery();
+      }, 500);
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value || value.length === 0) continue;
+        await processIncoming(value as Uint8Array);
+      }
     } catch (error) {
       console.error("Error de balanza:", error);
       setScaleRawData(
