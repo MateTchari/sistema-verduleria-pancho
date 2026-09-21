@@ -57,6 +57,7 @@ alter table public.cash_sessions enable row level security;
 create policy if not exists "Allow anon read products" on public.products for select using (true);
 create policy if not exists "Allow anon insert products" on public.products for insert with check (true);
 create policy if not exists "Allow anon update products" on public.products for update using (true) with check (true);
+create policy if not exists "Allow anon delete products" on public.products for delete using (true);
 
 create policy if not exists "Allow anon read sales" on public.sales for select using (true);
 create policy if not exists "Allow anon insert sales" on public.sales for insert with check (true);
