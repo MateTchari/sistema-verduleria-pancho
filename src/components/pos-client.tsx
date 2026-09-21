@@ -31,6 +31,8 @@ export function PosClient({ initialProducts }: PosClientProps) {
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
   const [manualWeight, setManualWeight] = useState("");
   const [scaleStatus, setScaleStatus] = useState<"idle" | "connecting" | "connected" | "unsupported" | "error">("idle");
+  const [scaleRawData, setScaleRawData] = useState("Sin datos recibidos todavía.");
+  const [scaleLastWeight, setScaleLastWeight] = useState<string | null>(null);
   const scalePortRef = useRef<any>(null);
   const scaleReaderRef = useRef<any>(null);
   const [paymentMethod, setPaymentMethod] = useState<"efectivo" | "tarjeta" | null>(null);
@@ -239,27 +241,63 @@ export function PosClient({ initialProducts }: PosClientProps) {
 
     try {
       setScaleStatus("connecting");
+      setScaleRawData("Abriendo puerto serial...");
+      setScaleLastWeight(null);
+
       const port = await serial.requestPort();
       await port.open({ baudRate: 9600 });
       scalePortRef.current = port;
       setScaleStatus("connected");
+      setScaleRawData("Puerto conectado a 9600 baudios. Esperando datos de la balanza...");
 
       const reader = port.readable?.getReader();
+      if (!reader) {
+        setScaleRawData("El puerto se abrió, pero no expone un flujo de lectura.");
+        setScaleStatus("error");
+        return;
+      }
+
       scaleReaderRef.current = reader;
       const decoder = new TextDecoder();
       let buffer = "";
+
       while (reader) {
         const { value, done } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+
+        const chunk = decoder.decode(value, { stream: true });
+        buffer += chunk;
+
+        const visible = buffer
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n")
+          .replace(/\t/g, "\\t");
+
+        setScaleRawData(visible.slice(-220));
+
         const weights = buffer.match(/-?\d+(?:[.,]\d+)?/g);
         if (weights?.length) {
-          const weight = Number(weights.at(-1)?.replace(",", "."));
-          if (Number.isFinite(weight) && weight >= 0) setManualWeight(String(weight));
+          const weightText = weights.at(-1) ?? "";
+          const weight = Number(weightText.replace(",", "."));
+
+          if (Number.isFinite(weight) && weight >= 0) {
+            const normalizedWeight = String(weight);
+            setManualWeight(normalizedWeight);
+            setScaleLastWeight(normalizedWeight);
+          }
         }
-        buffer = buffer.slice(-120);
+
+        buffer = buffer.slice(-220);
       }
-    } catch {
+
+      setScaleRawData((current) =>
+        current === "Puerto conectado a 9600 baudios. Esperando datos de la balanza..."
+          ? "La conexión terminó sin recibir datos."
+          : current
+      );
+    } catch (error) {
+      console.error("Error de balanza:", error);
+      setScaleRawData(error instanceof Error ? error.message : "Error desconocido al leer la balanza.");
       setScaleStatus("error");
     }
   };
@@ -273,6 +311,8 @@ export function PosClient({ initialProducts }: PosClientProps) {
       scaleReaderRef.current = null;
       scalePortRef.current = null;
       setScaleStatus("idle");
+      setScaleRawData("Sin datos recibidos todavía.");
+      setScaleLastWeight(null);
     }
   };
 
@@ -526,7 +566,17 @@ export function PosClient({ initialProducts }: PosClientProps) {
                   </div>
                   {scaleStatus === "connected" ? <p className="mt-2 text-xs text-emerald-700">Balanza conectada: el peso se actualizará automáticamente.</p> : null}
                   {scaleStatus === "unsupported" ? <p className="mt-2 text-xs text-amber-700">Este navegador no permite conectar balanzas. Usá Chrome o Edge de escritorio.</p> : null}
-                  {scaleStatus === "error" ? <p className="mt-2 text-xs text-rose-700">No se pudo conectar la balanza. Revisá el cable, el puerto y la velocidad de 9600 baudios.</p> : null}
+                  {scaleStatus === "error" ? <p className="mt-2 text-xs text-rose-700">No se pudo conectar o leer la balanza. Revisá el diagnóstico de abajo.</p> : null}
+
+                  {(scaleStatus === "connected" || scaleStatus === "error") ? (
+                    <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
+                      <p className="text-xs font-semibold text-slate-700">Diagnóstico de balanza</p>
+                      <p className="mt-1 break-all font-mono text-xs text-slate-600">{scaleRawData}</p>
+                      <p className="mt-2 text-xs text-slate-600">
+                        Último peso detectado: <span className="font-semibold">{scaleLastWeight ?? "ninguno"}</span>
+                      </p>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
               <div className="mt-5 grid gap-4 md:grid-cols-[1fr_auto]">
