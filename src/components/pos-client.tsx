@@ -20,7 +20,6 @@ interface PosClientProps {
 
 const formatCurrency = (value: number) => formatCurrencyValue(value);
 const POS_SESSION_STARTED_AT_KEY = "verduleria-pos-session-started-at";
-const VERDULERIA_SCALE_USB_KEY = "verduleria-scale-usb";
 
 const normalizeSearchText = (value: string) =>
   value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
@@ -37,13 +36,6 @@ export function PosClient({ initialProducts }: PosClientProps) {
   const selectedScalePortRef = useRef<any>(null);
   const selectedScaleInfoRef = useRef<{ usbVendorId?: number; usbProductId?: number } | null>(null);
   const scalePortRef = useRef<any>(null);
-
-  useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem(VERDULERIA_SCALE_USB_KEY);
-      if (saved) selectedScaleInfoRef.current = JSON.parse(saved);
-    } catch {}
-  }, []);
   const scaleReaderRef = useRef<any>(null);
   const scaleWriterRef = useRef<any>(null);
   const scalePollTimerRef = useRef<number | null>(null);
@@ -340,90 +332,53 @@ export function PosClient({ initialProducts }: PosClientProps) {
       await resetScaleConnection();
 
       setScaleStatus("connecting");
-      setScaleRawData("Buscando únicamente la balanza USB2.0-Ser!...");
+      setScaleRawData("Buscando la balanza seleccionada...");
       setScaleLastWeight(null);
 
       let port: any = null;
 
-      // Si ya conocemos la balanza, buscamos exclusivamente ese mismo adaptador USB.
+      // Si la balanza fue desenchufada y vuelta a enchufar, el objeto SerialPort
+      // anterior queda viejo. Buscamos la nueva instancia autorizada del mismo USB.
       if (selectedScaleInfoRef.current) {
         port = await findFreshAuthorizedPort();
       }
 
-      // Si todavía no está identificada, auto-elegimos el único puerto USB autorizado.
-      // COM1 queda descartado porque no tiene identificadores USB.
-      if (!port && serial.getPorts) {
-        const authorizedPorts = await serial.getPorts();
-        const usbPorts = authorizedPorts.filter((candidate) => {
-          if (typeof candidate?.getInfo !== "function") return false;
-          const info = candidate.getInfo?.() ?? {};
-          return info.usbVendorId != null && info.usbProductId != null;
-        });
-
-        if (usbPorts.length === 1) {
-          port = usbPorts[0];
-        }
+      if (!port && selectedScalePortRef.current) {
+        port = selectedScalePortRef.current;
       }
 
-      // Solo si no hay un USB autorizado pedimos elegirlo manualmente.
       if (!port) {
         port = await serial.requestPort();
       }
 
-      if (typeof port?.getInfo !== "function") {
-        selectedScalePortRef.current = null;
-        throw new Error("Ese puerto no es USB. Elegí USB2.0-Ser! y no COM1.");
-      }
-
-      const info = port.getInfo?.() ?? {};
-      if (info.usbVendorId == null || info.usbProductId == null) {
-        selectedScalePortRef.current = null;
-        throw new Error("Ese es COM1 u otro puerto no USB. Elegí USB2.0-Ser!.");
-      }
-
       selectedScalePortRef.current = port;
-      selectedScaleInfoRef.current = {
-        usbVendorId: info.usbVendorId,
-        usbProductId: info.usbProductId,
-      };
+
+      if (typeof port?.getInfo === "function") {
+        const info = port.getInfo?.() ?? {};
+        selectedScaleInfoRef.current = {
+          usbVendorId: info.usbVendorId,
+          usbProductId: info.usbProductId,
+        };
+      }
+
+      let reader: any;
+      let writer: any;
 
       try {
-        window.localStorage.setItem(
-          VERDULERIA_SCALE_USB_KEY,
-          JSON.stringify(selectedScaleInfoRef.current)
-        );
-      } catch {}
+        ({ reader, writer } = await openPort(port));
+      } catch (firstError) {
+        // Windows/CH340 puede tardar un instante en liberar o recrear COM tras
+        // desenchufar/reconectar. Rebuscamos la misma balanza y reintentamos una vez.
+        await sleep(900);
+        const freshPort = await findFreshAuthorizedPort();
 
-      let reader: any = null;
-      let writer: any = null;
-      let lastOpenError: unknown = null;
-
-      // El CH340 puede tardar un poco en quedar disponible después de
-      // desenchufar/reconectar. Reintentamos varias veces sobre el MISMO USB.
-      for (let attempt = 0; attempt < 4; attempt += 1) {
-        try {
-          ({ reader, writer } = await openPort(port));
-          lastOpenError = null;
-          break;
-        } catch (openError) {
-          lastOpenError = openError;
-
-          if (attempt < 3) {
-            await sleep(1000);
-
-            const freshPort = await findFreshAuthorizedPort();
-            if (freshPort) {
-              port = freshPort;
-              selectedScalePortRef.current = freshPort;
-            }
-          }
+        if (!freshPort || freshPort === port) {
+          throw firstError;
         }
-      }
 
-      if (!reader || !writer) {
-        throw lastOpenError instanceof Error
-          ? lastOpenError
-          : new Error("No se pudo abrir el puerto USB de la balanza.");
+        port = freshPort;
+        selectedScalePortRef.current = freshPort;
+        ({ reader, writer } = await openPort(freshPort));
       }
 
       scalePortRef.current = port;
@@ -509,9 +464,8 @@ export function PosClient({ initialProducts }: PosClientProps) {
         const { value, done } = await reader.read();
 
         if (done) {
-          await resetScaleConnection();
           setScaleStatus("error");
-          setScaleRawData("La balanza se desconectó físicamente. El puerto quedó liberado. Volvé a enchufarla, esperá 1–2 segundos y tocá Conectar balanza.");
+          setScaleRawData("La balanza se desconectó físicamente. Volvé a enchufarla y tocá Conectar balanza.");
           break;
         }
 
@@ -524,7 +478,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
       setScaleStatus("error");
       setScaleRawData(
         error instanceof Error
-          ? `${error.message} El sistema está usando únicamente el adaptador USB de la balanza. Si fue desenchufada, volvé a enchufarla, esperá 1–2 segundos y tocá Conectar balanza.`
+          ? `${error.message} Si la balanza fue desenchufada, volvé a enchufarla y tocá Conectar balanza: el sistema buscará nuevamente el mismo adaptador USB.`
           : "Error desconocido al conectar la balanza."
       );
     }
