@@ -34,6 +34,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
   const [scaleRawData, setScaleRawData] = useState("Sin datos recibidos todavía.");
   const [scaleLastWeight, setScaleLastWeight] = useState<string | null>(null);
   const selectedScalePortRef = useRef<any>(null);
+  const selectedScaleInfoRef = useRef<{ usbVendorId?: number; usbProductId?: number } | null>(null);
   const scalePortRef = useRef<any>(null);
   const scaleReaderRef = useRef<any>(null);
   const scaleWriterRef = useRef<any>(null);
@@ -272,6 +273,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
     const serial = (navigator as Navigator & {
       serial?: {
         requestPort: () => Promise<any>;
+        getPorts?: () => Promise<any[]>;
       };
     }).serial;
 
@@ -280,20 +282,34 @@ export function PosClient({ initialProducts }: PosClientProps) {
       return;
     }
 
-    try {
-      await resetScaleConnection();
+    const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
-      setScaleStatus("connecting");
-      setScaleRawData("Abriendo balanza fija a 9600 baudios...");
-      setScaleLastWeight(null);
+    const matchesSavedDevice = (port: any) => {
+      const saved = selectedScaleInfoRef.current;
+      if (!saved || typeof port?.getInfo !== "function") return false;
 
-      let port = selectedScalePortRef.current;
+      const info = port.getInfo?.() ?? {};
+      return (
+        info.usbVendorId === saved.usbVendorId &&
+        info.usbProductId === saved.usbProductId
+      );
+    };
 
-      if (!port) {
-        port = await serial.requestPort();
-        selectedScalePortRef.current = port;
+    const findFreshAuthorizedPort = async () => {
+      if (!serial.getPorts) return null;
+
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const ports = await serial.getPorts();
+        const matching = ports.find((port) => matchesSavedDevice(port));
+
+        if (matching) return matching;
+        if (attempt < 4) await sleep(500);
       }
 
+      return null;
+    };
+
+    const openPort = async (port: any) => {
       await port.open({
         baudRate: 9600,
         dataBits: 8,
@@ -307,6 +323,62 @@ export function PosClient({ initialProducts }: PosClientProps) {
 
       if (!reader || !writer) {
         throw new Error("El puerto se abrió pero no permite lectura/escritura.");
+      }
+
+      return { reader, writer };
+    };
+
+    try {
+      await resetScaleConnection();
+
+      setScaleStatus("connecting");
+      setScaleRawData("Buscando la balanza seleccionada...");
+      setScaleLastWeight(null);
+
+      let port: any = null;
+
+      // Si la balanza fue desenchufada y vuelta a enchufar, el objeto SerialPort
+      // anterior queda viejo. Buscamos la nueva instancia autorizada del mismo USB.
+      if (selectedScaleInfoRef.current) {
+        port = await findFreshAuthorizedPort();
+      }
+
+      if (!port && selectedScalePortRef.current) {
+        port = selectedScalePortRef.current;
+      }
+
+      if (!port) {
+        port = await serial.requestPort();
+      }
+
+      selectedScalePortRef.current = port;
+
+      if (typeof port?.getInfo === "function") {
+        const info = port.getInfo?.() ?? {};
+        selectedScaleInfoRef.current = {
+          usbVendorId: info.usbVendorId,
+          usbProductId: info.usbProductId,
+        };
+      }
+
+      let reader: any;
+      let writer: any;
+
+      try {
+        ({ reader, writer } = await openPort(port));
+      } catch (firstError) {
+        // Windows/CH340 puede tardar un instante en liberar o recrear COM tras
+        // desenchufar/reconectar. Rebuscamos la misma balanza y reintentamos una vez.
+        await sleep(900);
+        const freshPort = await findFreshAuthorizedPort();
+
+        if (!freshPort || freshPort === port) {
+          throw firstError;
+        }
+
+        port = freshPort;
+        selectedScalePortRef.current = freshPort;
+        ({ reader, writer } = await openPort(freshPort));
       }
 
       scalePortRef.current = port;
@@ -372,6 +444,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
       const sendEnq = async () => {
         if (writeInFlight) return;
         writeInFlight = true;
+
         try {
           await writer.write(new Uint8Array([0x05]));
         } catch (error) {
@@ -389,7 +462,13 @@ export function PosClient({ initialProducts }: PosClientProps) {
 
       while (true) {
         const { value, done } = await reader.read();
-        if (done) break;
+
+        if (done) {
+          setScaleStatus("error");
+          setScaleRawData("La balanza se desconectó físicamente. Volvé a enchufarla y tocá Conectar balanza.");
+          break;
+        }
+
         if (!value || value.length === 0) continue;
         await processIncoming(value as Uint8Array);
       }
@@ -399,7 +478,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
       setScaleStatus("error");
       setScaleRawData(
         error instanceof Error
-          ? `${error.message} Si el puerto quedó ocupado, esperá 1 segundo y reconectá.`
+          ? `${error.message} Si la balanza fue desenchufada, volvé a enchufarla y tocá Conectar balanza: el sistema buscará nuevamente el mismo adaptador USB.`
           : "Error desconocido al conectar la balanza."
       );
     }
@@ -665,7 +744,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
                     {scaleStatus === "connected" ? (
                       <button type="button" onClick={disconnectScale} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm">Desconectar</button>
                     ) : (
-                      <button type="button" onClick={connectScale} disabled={scaleStatus === "connecting"} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50">{scaleStatus === "connecting" ? "Conectando..." : "Conectar balanza"}</button>
+                      <button type="button" onClick={() => void connectScale()} disabled={scaleStatus === "connecting"} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50">{scaleStatus === "connecting" ? "Conectando..." : "Conectar balanza"}</button>
                     )}
                   </div>
                   {scaleStatus === "connected" ? <p className="mt-2 text-xs text-emerald-700">Balanza conectada: el peso se actualizará automáticamente.</p> : null}
