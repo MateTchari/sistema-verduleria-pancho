@@ -20,6 +20,7 @@ interface PosClientProps {
 
 const formatCurrency = (value: number) => formatCurrencyValue(value);
 const POS_SESSION_STARTED_AT_KEY = "verduleria-pos-session-started-at";
+const VERDULERIA_SCALE_USB_KEY = "verduleria-scale-usb";
 
 const normalizeSearchText = (value: string) =>
   value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
@@ -36,6 +37,13 @@ export function PosClient({ initialProducts }: PosClientProps) {
   const selectedScalePortRef = useRef<any>(null);
   const selectedScaleInfoRef = useRef<{ usbVendorId?: number; usbProductId?: number } | null>(null);
   const scalePortRef = useRef<any>(null);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(VERDULERIA_SCALE_USB_KEY);
+      if (saved) selectedScaleInfoRef.current = JSON.parse(saved);
+    } catch {}
+  }, []);
   const scaleReaderRef = useRef<any>(null);
   const scaleWriterRef = useRef<any>(null);
   const scalePollTimerRef = useRef<number | null>(null);
@@ -332,34 +340,59 @@ export function PosClient({ initialProducts }: PosClientProps) {
       await resetScaleConnection();
 
       setScaleStatus("connecting");
-      setScaleRawData("Buscando la balanza seleccionada...");
+      setScaleRawData("Buscando únicamente la balanza USB2.0-Ser!...");
       setScaleLastWeight(null);
 
       let port: any = null;
 
-      // Si la balanza fue desenchufada y vuelta a enchufar, el objeto SerialPort
-      // anterior queda viejo. Buscamos la nueva instancia autorizada del mismo USB.
+      // Si ya conocemos la balanza, buscamos exclusivamente ese mismo adaptador USB.
       if (selectedScaleInfoRef.current) {
         port = await findFreshAuthorizedPort();
       }
 
-      if (!port && selectedScalePortRef.current) {
-        port = selectedScalePortRef.current;
+      // Si todavía no está identificada, auto-elegimos el único puerto USB autorizado.
+      // COM1 queda descartado porque no tiene identificadores USB.
+      if (!port && serial.getPorts) {
+        const authorizedPorts = await serial.getPorts();
+        const usbPorts = authorizedPorts.filter((candidate) => {
+          if (typeof candidate?.getInfo !== "function") return false;
+          const info = candidate.getInfo?.() ?? {};
+          return info.usbVendorId != null && info.usbProductId != null;
+        });
+
+        if (usbPorts.length === 1) {
+          port = usbPorts[0];
+        }
       }
 
+      // Solo si no hay un USB autorizado pedimos elegirlo manualmente.
       if (!port) {
         port = await serial.requestPort();
       }
 
-      selectedScalePortRef.current = port;
-
-      if (typeof port?.getInfo === "function") {
-        const info = port.getInfo?.() ?? {};
-        selectedScaleInfoRef.current = {
-          usbVendorId: info.usbVendorId,
-          usbProductId: info.usbProductId,
-        };
+      if (typeof port?.getInfo !== "function") {
+        selectedScalePortRef.current = null;
+        throw new Error("Ese puerto no es USB. Elegí USB2.0-Ser! y no COM1.");
       }
+
+      const info = port.getInfo?.() ?? {};
+      if (info.usbVendorId == null || info.usbProductId == null) {
+        selectedScalePortRef.current = null;
+        throw new Error("Ese es COM1 u otro puerto no USB. Elegí USB2.0-Ser!.");
+      }
+
+      selectedScalePortRef.current = port;
+      selectedScaleInfoRef.current = {
+        usbVendorId: info.usbVendorId,
+        usbProductId: info.usbProductId,
+      };
+
+      try {
+        window.localStorage.setItem(
+          VERDULERIA_SCALE_USB_KEY,
+          JSON.stringify(selectedScaleInfoRef.current)
+        );
+      } catch {}
 
       let reader: any;
       let writer: any;
