@@ -20,7 +20,6 @@ interface PosClientProps {
 
 const formatCurrency = (value: number) => formatCurrencyValue(value);
 const POS_SESSION_STARTED_AT_KEY = "verduleria-pos-session-started-at";
-const SCALE_USB_DEVICE_KEY = "verduleria-scale-usb-device";
 
 const normalizeSearchText = (value: string) =>
   value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
@@ -272,7 +271,6 @@ export function PosClient({ initialProducts }: PosClientProps) {
     const serial = (navigator as Navigator & {
       serial?: {
         requestPort: () => Promise<any>;
-        getPorts?: () => Promise<any[]>;
       };
     }).serial;
 
@@ -288,64 +286,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
       setScaleRawData("Seleccioná el puerto correcto. La balanza quedará fija en 9600 / ENQ 0x05.");
       setScaleLastWeight(null);
 
-      let port: any = null;
-
-      let savedUsb: { usbVendorId?: number; usbProductId?: number } | null = null;
-      try {
-        savedUsb = JSON.parse(window.localStorage.getItem(SCALE_USB_DEVICE_KEY) ?? "null");
-      } catch {}
-
-      const isSameUsb = (candidate: any) => {
-        if (!savedUsb || typeof candidate?.getInfo !== "function") return false;
-        const info = candidate.getInfo?.() ?? {};
-        return (
-          info.usbVendorId === savedUsb.usbVendorId &&
-          info.usbProductId === savedUsb.usbProductId
-        );
-      };
-
-      if (serial.getPorts) {
-        const authorizedPorts = await serial.getPorts();
-
-        if (savedUsb) {
-          port = authorizedPorts.find((candidate) => isSameUsb(candidate)) ?? null;
-        }
-
-        if (!port && !savedUsb) {
-          const usbPorts = authorizedPorts.filter((candidate) => {
-            if (typeof candidate?.getInfo !== "function") return false;
-            const info = candidate.getInfo?.() ?? {};
-            return info.usbVendorId != null && info.usbProductId != null;
-          });
-
-          if (usbPorts.length === 1) {
-            port = usbPorts[0];
-          }
-        }
-      }
-
-      if (!port) {
-        port = await serial.requestPort();
-      }
-
-      if (typeof port?.getInfo !== "function") {
-        throw new Error("Ese puerto no es el USB de la balanza.");
-      }
-
-      const selectedInfo = port.getInfo?.() ?? {};
-      if (selectedInfo.usbVendorId == null || selectedInfo.usbProductId == null) {
-        throw new Error("Elegiste un puerto que no es USB. Seleccioná USB2.0-Ser!.");
-      }
-
-      try {
-        window.localStorage.setItem(
-          SCALE_USB_DEVICE_KEY,
-          JSON.stringify({
-            usbVendorId: selectedInfo.usbVendorId,
-            usbProductId: selectedInfo.usbProductId,
-          })
-        );
-      } catch {}
+      const port = await serial.requestPort();
 
       await port.open({
         baudRate: 9600,
