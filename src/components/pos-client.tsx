@@ -494,8 +494,9 @@ export function PosClient({ initialProducts }: PosClientProps) {
   const changeScale = async () => {
     await resetScaleConnection();
     selectedScalePortRef.current = null;
+    selectedScaleInfoRef.current = null;
     setScaleStatus("idle");
-    setScaleRawData("La próxima conexión te va a pedir elegir otra balanza.");
+    setScaleRawData("Puerto anterior olvidado. Tocá Conectar balanza y elegí el otro USB.");
     setScaleLastWeight(null);
   };
 
@@ -742,7 +743,10 @@ export function PosClient({ initialProducts }: PosClientProps) {
                       <p className="text-xs text-slate-500">Compatible con balanzas USB/serial que envían el peso como texto.</p>
                     </div>
                     {scaleStatus === "connected" ? (
-                      <button type="button" onClick={disconnectScale} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm">Desconectar</button>
+                      <div className="flex flex-wrap gap-2">
+                        <button type="button" onClick={disconnectScale} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm">Desconectar</button>
+                        <button type="button" onClick={() => void changeScale()} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm">Probar otro puerto</button>
+                      </div>
                     ) : (
                       <button type="button" onClick={() => void connectScale()} disabled={scaleStatus === "connecting"} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm disabled:opacity-50">{scaleStatus === "connecting" ? "Conectando..." : "Conectar balanza"}</button>
                     )}
