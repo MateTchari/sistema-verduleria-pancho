@@ -394,24 +394,36 @@ export function PosClient({ initialProducts }: PosClientProps) {
         );
       } catch {}
 
-      let reader: any;
-      let writer: any;
+      let reader: any = null;
+      let writer: any = null;
+      let lastOpenError: unknown = null;
 
-      try {
-        ({ reader, writer } = await openPort(port));
-      } catch (firstError) {
-        // Windows/CH340 puede tardar un instante en liberar o recrear COM tras
-        // desenchufar/reconectar. Rebuscamos la misma balanza y reintentamos una vez.
-        await sleep(900);
-        const freshPort = await findFreshAuthorizedPort();
+      // El CH340 puede tardar un poco en quedar disponible después de
+      // desenchufar/reconectar. Reintentamos varias veces sobre el MISMO USB.
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+          ({ reader, writer } = await openPort(port));
+          lastOpenError = null;
+          break;
+        } catch (openError) {
+          lastOpenError = openError;
 
-        if (!freshPort || freshPort === port) {
-          throw firstError;
+          if (attempt < 3) {
+            await sleep(1000);
+
+            const freshPort = await findFreshAuthorizedPort();
+            if (freshPort) {
+              port = freshPort;
+              selectedScalePortRef.current = freshPort;
+            }
+          }
         }
+      }
 
-        port = freshPort;
-        selectedScalePortRef.current = freshPort;
-        ({ reader, writer } = await openPort(freshPort));
+      if (!reader || !writer) {
+        throw lastOpenError instanceof Error
+          ? lastOpenError
+          : new Error("No se pudo abrir el puerto USB de la balanza.");
       }
 
       scalePortRef.current = port;
@@ -497,8 +509,9 @@ export function PosClient({ initialProducts }: PosClientProps) {
         const { value, done } = await reader.read();
 
         if (done) {
+          await resetScaleConnection();
           setScaleStatus("error");
-          setScaleRawData("La balanza se desconectó físicamente. Volvé a enchufarla y tocá Conectar balanza.");
+          setScaleRawData("La balanza se desconectó físicamente. El puerto quedó liberado. Volvé a enchufarla, esperá 1–2 segundos y tocá Conectar balanza.");
           break;
         }
 
@@ -511,7 +524,7 @@ export function PosClient({ initialProducts }: PosClientProps) {
       setScaleStatus("error");
       setScaleRawData(
         error instanceof Error
-          ? `${error.message} Si la balanza fue desenchufada, volvé a enchufarla y tocá Conectar balanza: el sistema buscará nuevamente el mismo adaptador USB.`
+          ? `${error.message} El sistema está usando únicamente el adaptador USB de la balanza. Si fue desenchufada, volvé a enchufarla, esperá 1–2 segundos y tocá Conectar balanza.`
           : "Error desconocido al conectar la balanza."
       );
     }
